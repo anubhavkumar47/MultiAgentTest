@@ -457,8 +457,8 @@ def main():
         'Avg Energy': energy_hist,
         'aoi':aoi_hist
     })
-    results_df.to_csv("training_log_pytorch.csv", index=False)
-    print("\nTraining Complete. Results saved to 'training_log_pytorch.csv'")
+    results_df.to_csv("training_log_gnn_test_01.csv", index=False)
+    print("\nTraining Complete. Results saved to 'training_log_gnn_test_01.csv'")
 
 if __name__ == "__main__":
     main()
