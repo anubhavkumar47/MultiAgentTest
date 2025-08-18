@@ -402,7 +402,7 @@ def main():
     
     agent = TD3Agent(env, n_nodes, n_node_features)
     
-    total_episodes = 10000
+    total_episodes = 1000
     batch_size = 256
     start_training_steps = 2000
     total_steps = 0
