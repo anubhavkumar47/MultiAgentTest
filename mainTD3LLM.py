@@ -14,12 +14,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 
-# --- Part 1: Environment Definition (State representation MODIFIED) ---
+# --- Part 1: Environment Definition ---
 class Environment:
     """
     Defines the multi-agent simulation environment for UAVs and IoT devices.
-    It manages state, actions, rewards, and dynamics, including collision avoidance
-    and simulated LLM guidance.
     """
     def __init__(self, num_uavs=3):
         super(Environment, self).__init__()
@@ -31,17 +29,12 @@ class Environment:
 
         # --- UAV & IoTD Initial State ---
         self.start_positions = np.array([
-            [0, 299, 100],
-            [150, 299, 100],
-            [299, 299, 100]
+            [0, 299, 100], [150, 299, 100], [299, 299, 100]
         ], dtype=float)
         self.iotd_position = np.array([
             [50, 50, 0], [75, 150, 0], [100, 100, 0], [100, 250, 0], [150, 150, 0]
         ], dtype=float)
-        self.e_position = np.array([
-            [250, 100, 0], [280, 200, 0], [175, 225, 0], [200, 200, 0], [100, 150, 0]
-        ], dtype=float)
-
+        
         # --- Physics, Communication & Safety Parameters ---
         self.R_min = 0.1
         self.P_tx_UAV = 0.5
@@ -72,29 +65,17 @@ class Environment:
         self.done = False
         return self._get_state()
 
-    # --- MODIFIED: State representation is now a flat vector ---
     def _get_state(self):
         """
         Constructs a flat state vector from the environment's properties.
-        This replaces the graph-based state representation.
         """
-        # Normalize positions by the environment size
         uav_pos_norm = self.uav_positions.flatten() / self.size[0]
         iotd_pos_norm = self.iotd_position.flatten() / self.size[0]
-        
-        # Normalize AoI and time by the max episode length
         aoi_norm = self.AoI / self.T
         time_norm = np.array([self.time / self.T])
         
-        # Energy levels are already in [0, 1]
-        
-        # Concatenate all features into a single flat vector
         state = np.concatenate([
-            uav_pos_norm,
-            iotd_pos_norm,
-            aoi_norm,
-            self.energy_levels,
-            time_norm
+            uav_pos_norm, iotd_pos_norm, aoi_norm, self.energy_levels, time_norm
         ]).astype(np.float32)
         
         return state
@@ -171,10 +152,8 @@ class Environment:
         h_B_A = self.beta_0 / (dist_B_to_A**2 + 1e-9)
         return np.log2(1 + (p_iotd_tx * h_IoTD_A) / (p_jam * h_B_A + self.noise_power))
 
-# --- Part 2: Graph Construction ---
-# --- REMOVED: build_graph_from_env, GCNLayer, and GNNBase are no longer needed. ---
 
-# --- Part 3: Neural Network Models (MODIFIED to use MLPs) ---
+# --- Part 3: Neural Network Models ---
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Critic, self).__init__()
@@ -182,7 +161,6 @@ class Critic(nn.Module):
         self.l1 = nn.Linear(state_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
-
         # Q2 architecture
         self.l4 = nn.Linear(state_dim + action_dim, 256)
         self.l5 = nn.Linear(256, 256)
@@ -190,11 +168,9 @@ class Critic(nn.Module):
 
     def forward(self, state, action):
         sa = torch.cat([state, action], 1)
-
         q1 = F.relu(self.l1(sa))
         q1 = F.relu(self.l2(q1))
         q1 = self.l3(q1)
-
         q2 = F.relu(self.l4(sa))
         q2 = F.relu(self.l5(q2))
         q2 = self.l6(q2)
@@ -223,7 +199,6 @@ class Actor(nn.Module):
         a = F.relu(self.l2(a))
         return self.max_action * torch.tanh(self.l3(a))
 
-# --- MODIFIED: Replay buffer for flat states ---
 class ReplayBuffer:
     def __init__(self, max_size, state_dim, action_dim):
         self.max_size = int(max_size)
@@ -254,14 +229,13 @@ class ReplayBuffer:
             torch.tensor(self.terminal_memory[batch], device=device)
         )
 
-# --- Part 4: TD3 Agent (MODIFIED to use new networks and buffer) ---
+# --- Part 4: TD3 Agent (MODIFIED to fix return type) ---
 class TD3Agent:
     def __init__(self, env, state_dim, action_dim, lr_actor=1e-4, lr_critic=3e-4,
                  gamma=0.99, tau=0.005, policy_noise=0.2, noise_clip=0.5, policy_freq=2,
                  expl_noise=0.1, epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=0.9995):
         self.env = env
         self.action_dim = action_dim
-        self.max_action_val = env.action_space.high[0] # For scaling noise
         
         self.max_action = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self.min_action = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
@@ -302,7 +276,7 @@ class TD3Agent:
         return action.detach().cpu().numpy().flatten()
 
     def learn(self, batch_size=256):
-        if self.memory.mem_cntr < batch_size: return
+        if self.memory.mem_cntr < batch_size: return 0, 0
         self.total_it += 1
 
         states, actions, rewards, next_states, dones = self.memory.sample_buffer(batch_size)
@@ -312,7 +286,6 @@ class TD3Agent:
             noise = (torch.randn_like(actions) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
             next_actions = self.actor_target(next_states) + noise
             next_actions = torch.clamp(next_actions, self.min_action, self.max_action)
-
             q1_next, q2_next = self.critic_target(next_states, next_actions)
             target_q = rewards + self.gamma * (1 - dones.float()) * torch.min(q1_next, q2_next)
 
@@ -322,9 +295,11 @@ class TD3Agent:
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
-
+        
+        actor_loss_val = 0
         if self.total_it % self.policy_freq == 0:
             actor_loss = -self.critic.Q1(states, self.actor(states)).mean()
+            actor_loss_val = actor_loss.item() # Get value before backward pass
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
@@ -337,13 +312,13 @@ class TD3Agent:
         if self.epsilon > self.epsilon_end:
             self.epsilon *= self.epsilon_decay
 
-        return actor_loss ,critic_loss
+        # --- FIX: Return Python numbers using .item() ---
+        return actor_loss_val, critic_loss.item()
 
-# --- Part 5: Main Training Loop (MODIFIED for new state_dim) ---
+# --- Part 5: Main Training Loop ---
 def main():
     env = Environment(num_uavs=3)
     
-    # --- MODIFIED: Get state and action dimensions from the env ---
     state = env.reset()
     state_dim = state.shape[0]
     action_dim = env.action_space.shape[0]
@@ -363,7 +338,7 @@ def main():
         state = env.reset()
         done = False
         ep_reward, ep_steps, ep_energy, ep_aoi = 0, 0, 0, 0
-        ep_aloss ,ep_closs =0,0
+        ep_aloss, ep_closs = 0.0, 0.0 # Initialize as floats
 
         while not done:
             if total_steps < start_training_steps:
@@ -378,13 +353,10 @@ def main():
             if 'aoi' in info_dict: ep_aoi = info_dict['aoi']
 
             if total_steps >= start_training_steps:
-               actor_loss,critic_loss= agent.learn(batch_size)
-               ep_aloss+=actor_loss
-               ep_closs+=critic_loss
-               
-
-                
-
+                actor_loss, critic_loss = agent.learn(batch_size)
+                ep_aloss += actor_loss
+                ep_closs += critic_loss
+            
             ep_reward += reward
             state = next_state
             total_steps += 1
@@ -392,10 +364,10 @@ def main():
         
         avg_reward = ep_reward / ep_steps if ep_steps > 0 else 0
         reward_history.append(avg_reward)
-        energy_hist.append(ep_energy/ep_steps+1)
-        aoi_hist.append(ep_aoi /ep_steps+1)
-        aloss.apend(actor_loss/ep_steps+1)
-        closs.append(critic_loss/ep_steps+1)
+        energy_hist.append(ep_energy)
+        aoi_hist.append(ep_aoi)
+        aloss.append(ep_aloss / ep_steps if ep_steps > 0 else 0)
+        closs.append(ep_closs / ep_steps if ep_steps > 0 else 0)
         epsilon_hist.append(agent.epsilon)
         
         print(f"Ep: {episode+1:4} | Avg Reward: {avg_reward:8.2f} | Total Energy: {ep_energy:8.2f} | Total AoI: {ep_aoi:8.2f} | Epsilon: {agent.epsilon:.4f}")
@@ -407,7 +379,8 @@ def main():
         'Total Energy': energy_hist,
         'Total AoI': aoi_hist,
         'Actor Loss': aloss,
-        'Critic Loss': closs   })
+        'Critic Loss': closs ,
+          })
     results_df.to_csv("training_log_multi_agent_td3_mlp.csv", index=False)
     print("Results saved to 'training_log_multi_agent_td3_mlp.csv'")
 
