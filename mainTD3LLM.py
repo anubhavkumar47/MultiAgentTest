@@ -379,8 +379,9 @@ def main():
 
             if total_steps >= start_training_steps:
                actor_loss,critic_loss= agent.learn(batch_size)
-                ep_aloss+=actor_loss
-                ep_closs+=critic_loss
+               ep_aloss+=actor_loss
+               ep_closs+=critic_loss
+               
 
                 
 
