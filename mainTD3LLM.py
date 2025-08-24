@@ -337,6 +337,8 @@ class TD3Agent:
         if self.epsilon > self.epsilon_end:
             self.epsilon *= self.epsilon_decay
 
+        return actor_loss ,critic_loss
+
 # --- Part 5: Main Training Loop (MODIFIED for new state_dim) ---
 def main():
     env = Environment(num_uavs=3)
@@ -354,12 +356,14 @@ def main():
     total_steps = 0
 
     reward_history, energy_hist, aoi_hist, epsilon_hist = [], [], [], []
+    closs,aloss =[],[]
 
     print(f"Starting TD3 training for {total_episodes} episodes...")
     for episode in range(total_episodes):
         state = env.reset()
         done = False
         ep_reward, ep_steps, ep_energy, ep_aoi = 0, 0, 0, 0
+        ep_aloss ,ep_closs =0,0
 
         while not done:
             if total_steps < start_training_steps:
@@ -374,7 +378,11 @@ def main():
             if 'aoi' in info_dict: ep_aoi = info_dict['aoi']
 
             if total_steps >= start_training_steps:
-                agent.learn(batch_size)
+               actor_loss,critic_loss= agent.learn(batch_size)
+                ep_aloss+=actor_loss
+                ep_closs+=critic_loss
+
+                
 
             ep_reward += reward
             state = next_state
@@ -383,8 +391,10 @@ def main():
         
         avg_reward = ep_reward / ep_steps if ep_steps > 0 else 0
         reward_history.append(avg_reward)
-        energy_hist.append(ep_energy)
-        aoi_hist.append(ep_aoi)
+        energy_hist.append(ep_energy/ep_steps+1)
+        aoi_hist.append(ep_aoi /ep_steps+1)
+        aloss.apend(actor_loss/ep_steps+1)
+        closs.append(critic_loss/ep_steps+1)
         epsilon_hist.append(agent.epsilon)
         
         print(f"Ep: {episode+1:4} | Avg Reward: {avg_reward:8.2f} | Total Energy: {ep_energy:8.2f} | Total AoI: {ep_aoi:8.2f} | Epsilon: {agent.epsilon:.4f}")
@@ -395,8 +405,8 @@ def main():
         'Average Reward': reward_history,
         'Total Energy': energy_hist,
         'Total AoI': aoi_hist,
-        'Epsilon': epsilon_hist
-    })
+        'Actor Loss': aloss,
+        'Critic Loss': closs   })
     results_df.to_csv("training_log_multi_agent_td3_mlp.csv", index=False)
     print("Results saved to 'training_log_multi_agent_td3_mlp.csv'")
 
