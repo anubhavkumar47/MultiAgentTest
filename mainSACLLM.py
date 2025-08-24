@@ -297,6 +297,7 @@ class SACAgent:
         self.alpha = self.log_alpha.exp().item()
 
         self.update_target_networks()
+        return actor_loss.item(), critic_loss.item()
 
     def update_target_networks(self):
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
@@ -313,18 +314,20 @@ def main():
 
     agent = SACAgent(env, state_dim, action_dim)
 
-    total_episodes = 10000
+    total_episodes = 10
     batch_size = 256
     start_training_steps = 1000
     total_steps = 0
 
     reward_history, energy_hist, aoi_hist = [], [], []
+    closs,aloss =[],[]
 
     print(f"Starting training for {total_episodes} episodes...")
     for episode in range(total_episodes):
         state = env.reset()
         done = False
         ep_reward, ep_steps, ep_energy, ep_aoi = 0, 0, 0, 0
+        ep_closs,ep_aloss =0,0
 
         while not done:
             action = env.action_space.sample() if total_steps < start_training_steps else agent.choose_action(state)
@@ -336,7 +339,9 @@ def main():
             if 'aoi' in info_dict: ep_aoi = info_dict['aoi']
 
             if total_steps >= start_training_steps:
-                agent.learn(batch_size)
+                actor_loss,critic_loss=agent.learn(batch_size)
+                ep_closs += critic_loss
+                ep_aloss+=actor_loss
 
             ep_reward += reward
             state = next_state
@@ -349,6 +354,8 @@ def main():
         
         reward_history.append(avg_reward)
         energy_hist.append(final_energy)
+        aloss.append(ep_aloss)
+        closs.append(ep_closs)
         aoi_hist.append(final_aoi)
         
         print(f"Ep: {episode+1:4} | Avg Reward: {avg_reward:8.2f} | Total Energy: {final_energy:8.2f} | Total AoI: {final_aoi:8.2f}")
@@ -359,6 +366,8 @@ def main():
         'Average Reward': reward_history,
         'Total Energy': energy_hist,
         'Total AoI': aoi_hist,
+        'Actor Loss': aloss,
+        'Critic Loss': closs ,
         })
     results_df.to_csv("training_log_multi_agent_sac_mlp.csv", index=False)
     print("Results saved to 'training_log_multi_agent_sac_mlp.csv'")
