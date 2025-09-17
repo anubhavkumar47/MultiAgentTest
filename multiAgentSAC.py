@@ -463,7 +463,7 @@ def visualize_episode(episode_history, env_params, filename="uav_flight_paths_sa
 
 # --- MODIFIED: Constants and Hyperparameters for SAC ---
 config = {
-    'seed': 12345, 'max_episodes': 5000, 'replay_size': 100000, 'gamma': 0.99,
+    'seed': 12345, 'max_episodes': 3000, 'replay_size': 100000, 'gamma': 0.99,
     'tau': 0.005, 'lr': 3e-4, 'hidden_size': 256, 'batch_size': 128, 'start_steps': 2000,
     'alpha': 0.2, # Initial alpha value (temperature)
     'target_update_interval': 1, # How often to update target networks
