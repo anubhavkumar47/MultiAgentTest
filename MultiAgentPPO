@@ -27,9 +27,9 @@ config = {
     'lr_actor': 0.0003,
     'lr_critic': 0.001,
     'hidden_size': 256,
-    'ppo_epochs': 10,       # Number of epochs for updating policy
-    'eps_clip': 0.2,        # Clip parameter for PPO
-    'gae_lambda': 0.95,     # Lambda for Generalized Advantage Estimation
+    'ppo_epochs': 10,      # Number of epochs for updating policy
+    'eps_clip': 0.2,       # Clip parameter for PPO
+    'gae_lambda': 0.95,      # Lambda for Generalized Advantage Estimation
 }
 
 # --- NEW: Rollout Buffer for On-Policy Data ---
@@ -86,7 +86,7 @@ class LLM_Simulator:
             if len(assignments) == num_collectors: break
         return assignments
 
-# --- REPLACED: PPO Actor-Critic Networks ---
+# --- FIXED: PPO Actor-Critic Networks ---
 class ActorCritic(nn.Module):
     """PPO Actor-Critic network for a single agent."""
     def __init__(self, state_dim, action_dim, hidden_dim, action_std_init):
@@ -117,28 +117,31 @@ class ActorCritic(nn.Module):
     def act(self, state):
         """Select an action from the policy distribution."""
         action_mean = self.actor(state)
-        cov_mat = torch.diag(self.action_log_std.exp().flatten())
-        dist = Normal(action_mean, cov_mat)
+        
+        # --- THIS IS THE FIX ---
+        # Squeeze the first dimension to match the 1D action_mean tensor
+        action_std = self.action_log_std.exp().squeeze(0).expand_as(action_mean)
+        
+        dist = Normal(action_mean, action_std)
 
         action = dist.sample()
-        action_logprob = dist.log_prob(action)
+        action_logprob = dist.log_prob(action).sum(-1)
         return action.detach(), action_logprob.detach()
 
     def evaluate(self, state, action):
         """Evaluate a state-action pair, returning logprob, state value, and entropy."""
         action_mean = self.actor(state)
-        action_var = self.action_log_std.exp().pow(2).expand_as(action_mean)
-        cov_mat = torch.diag_embed(action_var)
-        dist = Normal(action_mean, cov_mat)
+        # Note: No change is needed here because 'state' is a 2D batch, so shapes match
+        action_std = self.action_log_std.exp().expand_as(action_mean)
+        dist = Normal(action_mean, action_std)
 
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
+        action_logprobs = dist.log_prob(action).sum(-1)
+        dist_entropy = dist.entropy().sum(-1)
         state_values = self.critic(state)
 
         return action_logprobs, state_values, dist_entropy
 
-
-# --- REPLACED: Multi-Agent PPO (MAPPO) Agent ---
+# --- FIXED: Multi-Agent PPO (MAPPO) Agent ---
 class MAPPO:
     def __init__(self, global_state_dim, action_dims, num_agents, args):
         self.gamma = args['gamma']
@@ -166,8 +169,8 @@ class MAPPO:
             for i in range(self.num_agents):
                 state = torch.FloatTensor(states[i]).to(self.device)
                 action, log_prob = self.policies_old[i].act(state)
-                actions.append(action.cpu().numpy().flatten())
-                log_probs.append(log_prob.cpu().numpy().flatten())
+                actions.append(action.cpu().numpy())
+                log_probs.append(log_prob.cpu().numpy())
         return np.array(actions), np.array(log_probs)
 
     def update(self, memory):
@@ -181,13 +184,14 @@ class MAPPO:
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
         
+        # Normalizing the rewards
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-        # Convert list to tensor
-        old_states = torch.squeeze(torch.tensor(np.array(memory.states), dtype=torch.float32).to(self.device), 1)
-        old_actions = torch.squeeze(torch.tensor(np.array(memory.actions), dtype=torch.float32).to(self.device), 1)
-        old_logprobs = torch.squeeze(torch.tensor(np.array(memory.logprobs), dtype=torch.float32).to(self.device), 1)
+        # Convert list to tensor and handle shapes correctly
+        old_states = torch.FloatTensor(np.array(memory.states)[:, 0, :]).to(self.device)
+        old_actions = torch.FloatTensor(np.array(memory.actions)).to(self.device)
+        old_logprobs = torch.FloatTensor(np.array(memory.logprobs)).to(self.device)
         
         critic_losses, actor_losses = [], []
 
@@ -195,19 +199,19 @@ class MAPPO:
         for _ in range(self.ppo_epochs):
             for i in range(self.num_agents):
                 # Evaluating old actions and values
-                logprobs, state_values, dist_entropy = self.policies[i].evaluate(old_states, old_actions[:, i*3:(i+1)*3])
+                logprobs, state_values, dist_entropy = self.policies[i].evaluate(old_states, old_actions[:, i, :])
 
                 # Finding the ratio (pi_theta / pi_theta_old)
-                ratios = torch.exp(logprobs.sum(dim=1, keepdim=True) - old_logprobs[:, i*3:(i+1)*3].sum(dim=1, keepdim=True).detach())
+                ratios = torch.exp(logprobs - old_logprobs[:, i].detach())
 
                 # Finding Surrogate Loss
-                advantages = rewards - state_values.detach()
+                advantages = rewards - state_values.squeeze().detach()
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
                 # Final loss of clipped objective PPO
                 actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = self.MseLoss(state_values, rewards)
+                critic_loss = self.MseLoss(state_values.squeeze(), rewards)
                 
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * dist_entropy.mean()
 
@@ -270,7 +274,6 @@ class MultiAgentEnv(gym.Env):
         return [global_state for _ in range(self.num_agents)]
 
     def step(self, actions):
-        # Action is now scaled inside the actor's tanh layer, so no need for max_action scaling here
         actions_t = torch.from_numpy(actions).to(self.device).float()
         self.time += 1
         self.AoI += 1.0
@@ -369,13 +372,14 @@ def main():
         episode_propulsion_energy, episode_sum_aoi, episode_collisions = [], [], []
         critic_loss_val, actor_loss_val = -1, -1
 
-        while not done:
+        # This inner loop collects a trajectory
+        for t in range(env.T):
             time_step +=1
             actions, log_probs = agent.select_actions(obs)
             next_obs, reward, terminated, truncated, info = env.step(actions)
             done = terminated or truncated
 
-            # Saving reward and is_terminals:
+            # Saving data to buffer
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
             memory.states.append(obs)
@@ -386,11 +390,15 @@ def main():
             if time_step % config['update_timestep'] == 0:
                 critic_loss_val, actor_loss_val = agent.update(memory)
                 memory.clear()
+                time_step = 0
 
             episode_propulsion_energy.append(info['propulsion_energy'])
             episode_sum_aoi.append(info['sum_AoI'])
             episode_reward += reward
             obs = next_obs
+            
+            if done:
+                break
 
         episode_collisions.append(info['collisions'])
         log_entry = {
