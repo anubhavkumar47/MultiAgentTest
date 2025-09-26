@@ -13,561 +13,579 @@ from itertools import combinations
 import pandas as pd
 import os
 import copy
-from mpl_toolkits.mplot3d import Axes3D
-import math
 
-# --- Define a global device for consistency ---
+# --- Constants and Hyperparameters ---
+LOG_SIG_MAX = 2
+LOG_SIG_MIN = -20
+epsilon = 1e-6
+
+# Use CUDA if available, otherwise fall back to CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- REPLACED: New Prioritized Replay Buffer ---
+config = {
+    'seed': 42,
+    'start_steps': 2500,
+    'max_episodes': 1000,
+    'replay_size': 100000,
+    'gamma': 0.99,
+    'tau': 0.001,
+    'alpha': 0.2,
+    'lr_actor': 0.0004,   # Learning rate for the actor networks
+    'lr_critic': 0.0003,  # Learning rate for the critic network
+    'lr_alpha': 0.0001,   # Learning rate for the entropy temperature
+    'hidden_size': 256,
+    'batch_size': 256,
+    'epsilon': 0.1,         # 10% random exploration
+    'epsilon_decay': 0.995, # optional: decay per episode
+    'epsilon_min': 0.01,     # minimum epsilon
+    'automatic_entropy_tuning': True
+}
+
+# --- Replay Buffer ---
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, capacity, device="cpu", prioritized=False, alpha=0.6):
-        self.capacity = capacity
-        self.device = device
-        self.prioritized = prioritized
-        self.alpha = alpha  # prioritization strength
+    """A replay buffer for storing multi-agent experiences."""
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
 
-        # Pre-allocate memory
-        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
-        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
-        self.dones = np.zeros((capacity, 1), dtype=np.float32)
+    def push(self, global_state, actions, reward, next_global_state, done):
+        """Saves a transition for the entire multi-agent system."""
+        self.buffer.append((global_state, actions, reward, next_global_state, done))
 
-        # For prioritized replay
-        if prioritized:
-            self.priorities = np.zeros((capacity,), dtype=np.float32)
-            self.eps = 1e-6  # small constant to avoid zero probability
-
-        # Pointers
-        self.ptr = 0
-        self.size = 0
-
-    def push(self, state, action, reward, next_state, done):
-        """Add transition to buffer"""
-        
-        self.states[self.ptr] = state.cpu().numpy()
-        self.actions[self.ptr] = action.cpu().numpy()
-        self.rewards[self.ptr] = reward.cpu().numpy()
-        self.next_states[self.ptr] = next_state.cpu().numpy()
-        self.dones[self.ptr] = done.cpu().numpy()
-
-        if self.prioritized:
-            # Assign max priority initially so new samples are likely to be chosen
-            max_prio = self.priorities.max() if self.size > 0 else 1.0
-            self.priorities[self.ptr] = max_prio
-
-        # Update pointer
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def sample(self, batch_size, beta=0.4):
-        """Sample batch of transitions"""
-        if self.prioritized:
-            # Compute probabilities
-            probs = self.priorities[:self.size] ** self.alpha
-            probs /= probs.sum()
-
-            indices = np.random.choice(self.size, batch_size, p=probs)
-            # Importance-sampling weights
-            weights = (self.size * probs[indices]) ** (-beta)
-            weights /= weights.max()  # normalize
-            weights = torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1)
-        else:
-            indices = np.random.randint(0, self.size, size=batch_size)
-            weights = torch.ones((batch_size, 1), device=self.device)
-
-        # Convert to torch tensors directly
-        return (
-            torch.tensor(self.states[indices], device=self.device),
-            torch.tensor(self.actions[indices], device=self.device),
-            torch.tensor(self.rewards[indices], device=self.device),
-            torch.tensor(self.next_states[indices], device=self.device),
-            torch.tensor(self.dones[indices], device=self.device),
-            indices,
-            weights,
-        )
-
-    def update_priorities(self, indices, td_errors):
-        """Update priorities after learning step"""
-        if self.prioritized:
-            self.priorities[indices] = np.abs(td_errors.detach().cpu().numpy()) + self.eps
+    def sample(self, batch_size):
+        global_state, actions, reward, next_global_state, done = zip(*random.sample(self.buffer, batch_size))
+        return np.array(global_state), np.array(actions), np.array(reward), np.array(next_global_state), np.array(done)
 
     def __len__(self):
-        return self.size
+        return len(self.buffer)
 
+# --- LLM Simulator for High-Level Decisions ---
+class LLM_Simulator:
+    """
+    A simulated LLM to make high-level decisions like adjusting penalties
+    and handling task offloading based on the current environment state.
+    """
+    def __init__(self):
+        self.base_aoi_penalty_weight = 0.01
+        self.base_propulsion_penalty_weight = 0.1
+        print("LLM Simulator Initialized: Ready to provide strategic guidance.")
 
-# --- NEW: SAC Actor Network (Replaces DiffusionActor) ---
-class GaussianActor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim, max_action=1.0):
-        super(GaussianActor, self).__init__()
-        self.max_action = max_action
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.mean_layer = nn.Linear(hidden_dim, action_dim)
-        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+    def adjust_penalties(self, avg_aoi, uav_propulsion_energy):
+        """Dynamically adjusts penalty weights based on situational context."""
+        aoi_weight = self.base_aoi_penalty_weight
+        energy_weight = self.base_propulsion_penalty_weight
+
+        # Situation 1: AoI is becoming critically high
+        if avg_aoi > 40:
+            aoi_weight *= 5  # Increase penalty to prioritize AoI reduction
+
+        # Situation 2: High energy consumption detected
+        if uav_propulsion_energy > 30: # Assuming 30 is a high value
+            energy_weight *= 3 # Increase penalty to encourage more efficient flight
+
+        return aoi_weight, energy_weight
+
+    def decide_task_offload(self, uav_positions, iotd_positions):
+        """
+        Simulates task offloading by re-assigning collectors to the nearest IoT devices.
+        This represents a high-level strategic decision.
+        """
+        num_collectors = 2
+        distances = torch.cdist(uav_positions[:num_collectors], iotd_positions)
         
-        # Action rescaling
-        self.action_scale = torch.tensor((max_action), device=DEVICE)
+        assignments = []
+        assigned_iots = set()
+        
+        sorted_distances = []
+        for uav_idx in range(num_collectors):
+            for iot_idx in range(iotd_positions.shape[0]):
+                sorted_distances.append((distances[uav_idx, iot_idx].item(), uav_idx, iot_idx))
+        
+        sorted_distances.sort()
+
+        assigned_uavs = set()
+        for _, uav_idx, iot_idx in sorted_distances:
+            if uav_idx not in assigned_uavs and iot_idx not in assigned_iots:
+                assignments.append((uav_idx, iot_idx))
+                assigned_uavs.add(uav_idx)
+                assigned_iots.add(iot_idx)
+            if len(assignments) == num_collectors:
+                break
+        
+        return assignments
+
+# --- Decentralized Actor Network ---
+class Actor(nn.Module):
+    """Gaussian Policy Actor Network for an individual agent."""
+    def __init__(self, num_inputs, num_actions, hidden_dim, action_space=None):
+        super(Actor, self).__init__()
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean_linear = nn.Linear(hidden_dim, num_actions)
+        self.log_std_linear = nn.Linear(hidden_dim, num_actions)
+
+        if action_space is None:
+            self.action_scale = torch.tensor(1., device=DEVICE)
+            self.action_bias = torch.tensor(0., device=DEVICE)
+        else:
+            self.action_scale = torch.FloatTensor((action_space.high - action_space.low) / 2.).to(DEVICE)
+            self.action_bias = torch.FloatTensor((action_space.high + action_space.low) / 2.).to(DEVICE)
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        mean = self.mean_layer(x)
-        log_std = self.log_std_layer(x)
-        log_std = torch.clamp(log_std, min=-20, max=2)
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        mean = self.mean_linear(x)
+        log_std = self.log_std_linear(x)
+        log_std = torch.clamp(log_std, min=LOG_SIG_MIN, max=LOG_SIG_MAX)
         return mean, log_std
 
     def sample(self, state):
         mean, log_std = self.forward(state)
         std = log_std.exp()
         normal = Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        x_t = normal.rsample()
         y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale
+        action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + epsilon)
         log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale
-        return action, log_prob, mean
+        return action, log_prob
 
-# --- Centralized Transformer Critic Network (Unchanged) ---
-class TransformerCritic(nn.Module):
-    def __init__(self, num_agents, state_dim, action_dim, hidden_dim):
-        super(TransformerCritic, self).__init__()
-        self.num_agents = num_agents
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        input_dim = state_dim + action_dim
-        self.input_embed1 = nn.Linear(input_dim, hidden_dim)
-        encoder_layer1 = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim, batch_first=True)
-        self.transformer_encoder1 = nn.TransformerEncoder(encoder_layer1, num_layers=2)
-        self.output_head1 = nn.Linear(hidden_dim * num_agents, 1)
-        self.input_embed2 = nn.Linear(input_dim, hidden_dim)
-        encoder_layer2 = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim, batch_first=True)
-        self.transformer_encoder2 = nn.TransformerEncoder(encoder_layer2, num_layers=2)
-        self.output_head2 = nn.Linear(hidden_dim * num_agents, 1)
+# --- Centralized Critic Network ---
+class CentralizedCritic(nn.Module):
+    """Twin Q-Network Critic that takes the global state and joint actions."""
+    def __init__(self, global_state_dim, joint_action_dim, hidden_dim):
+        super(CentralizedCritic, self).__init__()
+        input_dim = global_state_dim + joint_action_dim
+        # Q1 architecture
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+        # Q2 architecture
+        self.linear4 = nn.Linear(input_dim, hidden_dim)
+        self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear6 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, states, actions):
-        batch_size = states.shape[0]
-        states_expanded = states.unsqueeze(1).expand(-1, self.num_agents, -1)
-        actions_reshaped = actions.view(batch_size, self.num_agents, self.action_dim)
-        x = torch.cat([states_expanded, actions_reshaped], dim=-1)
-        x1 = self.input_embed1(x)
-        x1 = self.transformer_encoder1(x1)
-        x1 = x1.view(batch_size, -1)
-        q1 = self.output_head1(x1)
-        x2 = self.input_embed2(x)
-        x2 = self.transformer_encoder2(x2)
-        x2 = x2.view(batch_size, -1)
-        q2 = self.output_head2(x2)
+    def forward(self, global_state, joint_action):
+        xu = torch.cat([global_state, joint_action], 1)
+        x1 = F.relu(self.linear1(xu)); x1 = F.relu(self.linear2(x1)); q1 = self.linear3(x1)
+        x2 = F.relu(self.linear4(xu)); x2 = F.relu(self.linear5(x2)); q2 = self.linear6(x2)
         return q1, q2
 
-# --- LLM Simulator for High-Level Decisions (Unchanged) ---
-class LLM_Simulator:
-    def __init__(self):
-        self.base_aoi_penalty_weight = 0.01
-        self.base_propulsion_penalty_weight = 0.1
-
-    def adjust_penalties(self, avg_aoi, uav_propulsion_energy):
-        aoi_weight = self.base_aoi_penalty_weight
-        energy_weight = self.base_propulsion_penalty_weight
-        if avg_aoi > 40: aoi_weight *= 5
-        if uav_propulsion_energy > 30: energy_weight *= 3
-        return aoi_weight, energy_weight
-
-    def decide_task_offload(self, uav_positions, iotd_positions):
-        num_collectors = 2
-        distances = torch.cdist(uav_positions[:num_collectors], iotd_positions)
-        iot_indices = torch.sort(distances.flatten()).indices
-        assignments, assigned_uavs, assigned_iots = [], set(), set()
-        for idx in iot_indices:
-            uav_idx = idx // iotd_positions.shape[0]
-            iot_idx = idx % iotd_positions.shape[0]
-            if uav_idx.item() not in assigned_uavs and iot_idx.item() not in assigned_iots:
-                assignments.append((uav_idx.item(), iot_idx.item()))
-                assigned_uavs.add(uav_idx.item())
-                assigned_iots.add(iot_idx.item())
-            if len(assignments) == num_collectors: break
-        return assignments
-
-# --- NEW: Multi-Agent SAC Agent ---
-class MASAC:
-    def __init__(self, num_agents, state_dim, action_dim, hidden_dim, max_action, args):
+# --- Multi-Agent SAC (MASAC) Agent ---
+class MASAC(object):
+    def __init__(self, global_state_dim, action_spaces, num_agents, args):
+        self.gamma = args['gamma']; self.tau = args['tau']; self.alpha = args['alpha']
+        self.batch_size = args['batch_size']
         self.num_agents = num_agents
-        self.action_dim = action_dim
         self.device = DEVICE
-        print(f"Using device: {self.device}")
-        
-        self.gamma = args['gamma']
-        self.tau = args['tau']
-        self.alpha = args['alpha']
-        self.target_update_interval = args['target_update_interval']
-        self.total_it = 0
+        print(f"Training on device: {self.device}")
 
-        # Actors
-        self.actors = [GaussianActor(state_dim, action_dim, hidden_dim, max_action).to(self.device) for _ in range(num_agents)]
-        self.actors_optimizer = [optim.Adam(actor.parameters(), lr=args['lr']) for actor in self.actors]
+        joint_action_dim = sum(space.shape[0] for space in action_spaces)
 
-        # Critic
-        self.critic = TransformerCritic(num_agents, state_dim, action_dim, hidden_dim).to(self.device)
+        self.critic = CentralizedCritic(global_state_dim, joint_action_dim, args['hidden_size']).to(self.device)
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=args['lr_critic'])
         self.critic_target = copy.deepcopy(self.critic)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args['lr'])
 
-        # Automatic Entropy Tuning
-        self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(DEVICE)).item()
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=args['lr'])
+        self.actor_update = 0
 
+        # Create decentralized actors with a separate learning rate
+        self.actors = []
+        self.actor_optims = []
+        for i in range(num_agents):
+            actor = Actor(global_state_dim, action_spaces[i].shape[0], args['hidden_size'], action_spaces[i]).to(self.device)
+            self.actors.append(actor)
+            self.actor_optims.append(optim.Adam(actor.parameters(), lr=args['lr_actor']))
 
-    def select_action(self, states, evaluate=False):
-        states = [torch.FloatTensor(s).to(self.device).unsqueeze(0) for s in states]
+        self.automatic_entropy_tuning = args['automatic_entropy_tuning']
+        if self.automatic_entropy_tuning:
+            self.target_entropies = [-torch.prod(torch.Tensor(space.shape).to(self.device)).item() for space in action_spaces]
+            self.log_alphas = [torch.zeros(1, requires_grad=True, device=self.device) for _ in range(num_agents)]
+            self.alpha_optims = [optim.Adam([log_alpha], lr=args['lr_alpha']) for log_alpha in self.log_alphas]
+
+    def select_actions(self, states, evaluate=False):
         actions = []
-        with torch.no_grad():
-            for i in range(self.num_agents):
-                if evaluate:
-                    _, _, action = self.actors[i].sample(states[i])
-                else:
-                    action, _, _ = self.actors[i].sample(states[i])
-                actions.append(action.cpu().data.numpy().flatten())
+        for i in range(self.num_agents):
+            state = torch.FloatTensor(states[i]).to(self.device).unsqueeze(0)
+            action, _ = self.actors[i].sample(state)
+            actions.append(action.detach().cpu().numpy()[0])
         return np.array(actions)
 
-    def update_parameters(self, memory, beta=0.4):
-        self.total_it += 1
-        if len(memory) < config['batch_size']:
-            return None, None, None
+    def update_parameters(self, memory):
+        if len(memory) < self.batch_size:
+            return None, [None]*self.num_agents
 
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch, indices, weights = memory.sample(config['batch_size'], beta)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(self.batch_size)
         
-        # Normalization
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+        done_batch = torch.FloatTensor(1 - done_batch).to(self.device).unsqueeze(1)
+
         reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-8)
         state_batch = (state_batch - state_batch.mean()) / (state_batch.std() + 1e-8)
         next_state_batch = (next_state_batch - next_state_batch.mean()) / (next_state_batch.std() + 1e-8)
         action_batch = (action_batch - action_batch.mean()) / (action_batch.std() + 1e-8)
+        
 
-        # --- Critic Update ---
+        # --- Update Critic ---
         with torch.no_grad():
-            next_actions = []
-            next_log_pis = []
+            next_actions, next_log_pis = [], []
             for i in range(self.num_agents):
-                next_action, next_log_pi, _ = self.actors[i].sample(next_state_batch)
-                next_actions.append(next_action)
-                next_log_pis.append(next_log_pi)
+                action, log_pi = self.actors[i].sample(next_state_batch)
+                next_actions.append(action)
+                next_log_pis.append(log_pi)
             
-            next_actions = torch.cat(next_actions, dim=1)
-            next_log_pis = torch.cat(next_log_pis, dim=1).sum(dim=1, keepdim=True)
+            joint_next_actions = torch.cat(next_actions, dim=1)
+            joint_next_log_pi = torch.cat(next_log_pis, dim=1).sum(dim=1, keepdim=True)
 
-            target_Q1, target_Q2 = self.critic_target(next_state_batch, next_actions)
-            target_Q = torch.min(target_Q1, target_Q2) - self.alpha * next_log_pis
-            next_q_value = reward_batch + (1 - done_batch) * self.gamma * target_Q
-
+            qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, joint_next_actions)
+            min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * joint_next_log_pi
+            next_q_value = reward_batch + done_batch * self.gamma * min_qf_next_target
+        
         qf1, qf2 = self.critic(state_batch, action_batch)
-        
-        # Weighted loss for prioritized replay
-        qf1_loss = F.mse_loss(qf1, next_q_value, reduction='none')
-        qf2_loss = F.mse_loss(qf2, next_q_value, reduction='none')
-        qf_loss = (weights * (qf1_loss + qf2_loss)).mean()
+        qf_loss = F.mse_loss(qf1, next_q_value) + F.mse_loss(qf2, next_q_value)
 
-        self.critic_optimizer.zero_grad()
+        self.critic_optim.zero_grad()
         qf_loss.backward()
-        self.critic_optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optim.step()
+        self.actor_update+=1
 
-        # Update priorities in replay buffer
-        td_errors = (torch.min(qf1_loss, qf2_loss)).detach().squeeze()
-        memory.update_priorities(indices, td_errors)
+        # --- Update Actors ---
         
-        # --- Actor and Alpha Update ---
-        actions_pred, log_pis_pred = [], []
-        for i in range(self.num_agents):
-            pi, log_pi, _ = self.actors[i].sample(state_batch)
-            actions_pred.append(pi)
-            log_pis_pred.append(log_pi)
+        policy_losses = []
+        if self.actor_update % 5 ==0 :
+            for i in range(self.num_agents):
+                actions_pred, log_pis = [], []
+                for j in range(self.num_agents):
+                    if i == j:
+                        action, log_pi = self.actors[j].sample(state_batch)
+                        actions_pred.append(action)
+                        log_pis.append(log_pi)
+                    else:
+                        # Detach other agents' actions to stabilize learning
+                        action_dim = self.actors[j].mean_linear.out_features
+                        start_idx = sum(self.actors[k].mean_linear.out_features for k in range(j))
+                        end_idx = start_idx + action_dim
+                        actions_pred.append(action_batch[:, start_idx:end_idx].detach())
+            
+                joint_actions_pred = torch.cat(actions_pred, dim=1)
+                qf1_pi, qf2_pi = self.critic(state_batch, joint_actions_pred)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+            
+                alpha = self.log_alphas[i].exp().item() if self.automatic_entropy_tuning else self.alpha
+                policy_loss = ((alpha * log_pis[0]) - min_qf_pi).mean()
+                policy_losses.append(policy_loss.item())
 
-        actions_pred = torch.cat(actions_pred, dim=1)
-        log_pis_pred = torch.cat(log_pis_pred, dim=1).sum(dim=1, keepdim=True)
+                self.actor_optims[i].zero_grad()
+                policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 1.0)
+                self.actor_optims[i].step()
+
+                if self.automatic_entropy_tuning:
+                    alpha_loss = -(self.log_alphas[i] * (log_pis[0] + self.target_entropies[i]).detach()).mean()
+                    self.alpha_optims[i].zero_grad()
+                    alpha_loss.backward()
+                    self.alpha_optims[i].step()
         
-        qf1_pi, qf2_pi = self.critic(state_batch, actions_pred)
-        min_qf_pi = torch.min(qf1_pi, qf2_pi)
-        
-        policy_loss = ((self.alpha * log_pis_pred) - min_qf_pi).mean()
+        self.soft_update(self.critic_target, self.critic, self.tau)
+        return qf_loss.item(), policy_losses
 
-        for optim in self.actors_optimizer: optim.zero_grad()
-        policy_loss.backward()
-        for optim in self.actors_optimizer: optim.step()
-        
-        # Alpha (temperature) update
-        alpha_loss = -(self.log_alpha * (log_pis_pred + self.target_entropy).detach()).mean()
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-        self.alpha = self.log_alpha.exp()
-        alpha_tlogs = self.alpha.clone()
-        
-        # --- Soft Target Updates ---
-        if self.total_it % self.target_update_interval == 0:
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+    def soft_update(self, target, source, tau):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
-        return qf_loss.item(), policy_loss.item(), alpha_tlogs.item()
-
-
-# --- Custom Multi-Agent Environment (Unchanged) ---
+# --- Custom Multi-Agent Environment (Modified) ---
 class MultiAgentEnv(gym.Env):
+    """
+    A custom multi-agent environment for UAV-assisted IoT data collection.
+    This modified version includes detailed energy consumption models for both
+    UAVs and IoT devices, and a TDMA-based communication protocol.
+    """
     def __init__(self, num_uavs=3, num_IoTD=5, T=100):
         super().__init__()
         self.device = DEVICE
         self.num_agents = self.num_uavs = num_uavs
+        # In this setup, UAVs 0 and 1 are collectors, UAV 2 is a jammer.
         self.num_collectors, self.num_IoTD, self.T = 2, num_IoTD, T
+
+        # --- Environment Geometry and Positions ---
         self.size = torch.tensor([300.0, 300.0, 300.0], device=self.device)
         iot_positions = np.array([[50,50,0],[75,150,0],[100,100,0],[100,250,0],[150,150,0]], dtype=np.float32)
         self.iotd_position = torch.tensor(iot_positions, device=self.device, dtype=torch.float32)
         self.eavesdropper_pos = torch.tensor([150.0, 0.0, 0.0], device=self.device)
-        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.1, 0.5, 0.1, 0.1
+
+        # --- Physics and Communication Parameters ---
+        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.2, 0.5, 0.1, 0.1
         self.eta, self.beta_0, self.noise_power = 0.5, 1e-3, 1e-13
         self.collision_threshold = 5.0
-        self.iot_idle_drain_rate = 0.001
-        self.iot_comm_drain_rate = 0.05
-        self.uav_comm_energy_cost = 0.02
-        self.action_space = Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+
+        # --- NEW: Energy Consumption Parameters ---
+        self.iot_idle_drain_rate = 0.001  # Low constant energy drain for IoT devices
+        self.iot_comm_drain_rate = 0.05   # Energy cost for an IoT device to transmit data
+        self.uav_comm_energy_cost = 0.02  # Energy cost for a UAV to perform a charge/collect task
+
+        # --- Action and Observation Spaces ---
+        self.action_spaces = [Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32) for _ in range(self.num_uavs)]
+        
+        # MODIFIED: Observation space shape now includes UAV energy levels
         obs_shape = (self.num_uavs * 3) + (2 * self.num_IoTD) + self.num_uavs
         self.observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
+
         self.llm = LLM_Simulator()
         self.current_assignments = []
         self.reset()
 
     def reset(self, seed=None, options=None):
-        if seed is not None: super().reset(seed=seed)
+        super().reset(seed=seed)
         low = torch.tensor([0.0, 0.0, 100.0], device=self.device)
         self.uav_positions = low + torch.rand((self.num_uavs, 3), device=self.device) * (self.size - low)
+        
+        # --- State Variables ---
         self.AoI = torch.zeros(self.num_IoTD, device=self.device)
         self.iot_energy_levels = torch.ones(self.num_IoTD, device=self.device)
+        # NEW: UAV energy levels are now part of the state
         self.uav_energy_levels = torch.ones(self.num_uavs, device=self.device)
+        
         self.time = 0
         self.collision_count = 0
         return self._get_obs(), {}
 
     def _get_global_state(self):
-        return torch.cat([self.uav_positions.flatten(), self.AoI, self.iot_energy_levels, self.uav_energy_levels])
+        """Constructs the global state vector from all environment variables."""
+        # MODIFIED: Include UAV energy levels in the state
+        return torch.cat([
+            self.uav_positions.flatten(), 
+            self.AoI, 
+            self.iot_energy_levels,
+            self.uav_energy_levels
+        ]).detach().cpu().numpy()
 
     def _get_obs(self):
-        global_state = self._get_global_state().detach().cpu().numpy()
+        """Returns a list of observations for each agent (all agents see the global state)."""
+        global_state = self._get_global_state()
         return [global_state for _ in range(self.num_agents)]
 
     def step(self, actions):
-        actions_t = torch.tensor(actions, device=self.device, dtype=torch.float32)
+        actions_t = torch.from_numpy(actions).to(self.device).float()
+        
         self.time += 1
         self.AoI += 1.0
+        
+        # --- NEW: Apply idle energy drain to all IoT devices at each step ---
         self.iot_energy_levels -= self.iot_idle_drain_rate
         self.iot_energy_levels.clamp_(min=0.0)
+
         past_positions = self.uav_positions.clone()
         self.uav_positions += actions_t * 20.0
+
+        # Calculate standard penalties and energy costs
         collision_penalty = self._check_collisions_torch()
         boundary_penalty = self._check_boundaries_torch()
         propulsion_energy = torch.sum(torch.linalg.norm(self.uav_positions - past_positions, dim=1))
+
+        # --- LLM Integration ---
         avg_aoi = torch.mean(self.AoI).item()
         aoi_penalty_weight, energy_penalty_weight = self.llm.adjust_penalties(avg_aoi, propulsion_energy.item())
+
         if self.time % 25 == 0 or not self.current_assignments:
             self.current_assignments = self.llm.decide_task_offload(self.uav_positions, self.iotd_position)
+
         reward_success, reward_fail = 0.0, 0.0
+        
+        # --- MODIFIED: TDMA-based sequential interaction (Charge then Collect) ---
         for uav_idx, iot_idx in self.current_assignments:
+            # Skip if the UAV doesn't have enough energy for the task
             if self.uav_energy_levels[uav_idx] < self.uav_comm_energy_cost:
-                reward_fail -= 0.5; continue
+                reward_fail -= 0.5 # Small penalty for UAV lacking energy
+                continue
+
             collector_uav_pos = self.uav_positions[uav_idx]
+            
+            # --- Phase 1: Energy Transfer (UAV -> IoT) ---
             dist_UAV_IoTD = torch.linalg.norm(collector_uav_pos - self.iotd_position[iot_idx])
             energy_harvested = self.P_tx_UAV * (self.beta_0 / (dist_UAV_IoTD**2 + 1e-9)) * self.eta
             self.iot_energy_levels[iot_idx] += energy_harvested
+            
+            # --- Phase 2: Data Collection (IoT -> UAV) ---
             if self.iot_energy_levels[iot_idx] >= self.iot_comm_drain_rate:
+                # IoT device consumes energy to send data
                 self.iot_energy_levels[iot_idx] -= self.iot_comm_drain_rate
+
                 secure_rate = self._calculate_secure_rate_torch(collector_uav_pos, self.iotd_position[iot_idx])
+                
                 if secure_rate > self.R_min:
-                    reward_success += 10.0; self.AoI[iot_idx] = 0.0
-                else: reward_fail -= 1.0
-            else: reward_fail -= 1.0
+                    reward_success += 10.0
+                    self.AoI[iot_idx] = 0.0
+                else:
+                    reward_fail -= 1.0 # Failure due to low secure rate
+            else:
+                reward_fail -= 1.0 # Failure due to insufficient IoT energy
+            
+            # NEW: UAV consumes energy for performing the communication task
             self.uav_energy_levels[uav_idx] -= self.uav_comm_energy_cost
+        
         self.iot_energy_levels.clamp_(min=0.0, max=1.0)
         self.uav_energy_levels.clamp_(min=0.0, max=1.0)
+        
         aoi_penalty = -aoi_penalty_weight * torch.mean(self.AoI).item()
         energy_penalty = -energy_penalty_weight * propulsion_energy.item()
+        
         reward = reward_success + reward_fail + aoi_penalty + energy_penalty + collision_penalty + boundary_penalty
+        
         terminated = self.time >= self.T
-        info = {'propulsion_energy': propulsion_energy.item(), 'sum_AoI': torch.sum(self.AoI).item(), 'collisions': self.collision_count, 'avg_iot_energy': torch.mean(self.iot_energy_levels).item(), 'avg_uav_energy': torch.mean(self.uav_energy_levels).item()}
+        info = {
+            'propulsion_energy': propulsion_energy.item(), 
+            'sum_AoI': torch.sum(self.AoI).item(), 
+            'collisions': self.collision_count,
+            'avg_iot_energy': torch.mean(self.iot_energy_levels).item(),
+            'avg_uav_energy': torch.mean(self.uav_energy_levels).item()
+        }
+        
         return self._get_obs(), reward, terminated, False, info
 
     def _check_boundaries_torch(self):
-        lower, upper = torch.zeros(3, device=self.device), self.size
+        """Checks if any UAV has flown out of the designated area."""
+        lower, upper = torch.tensor([0.,0.,0.], device=self.device), self.size
         out_of_bounds = torch.any((self.uav_positions < lower) | (self.uav_positions > upper), dim=1)
         penalty = -1.0 * torch.sum(out_of_bounds).item()
-        self.uav_positions.clamp_(lower.expand_as(self.uav_positions), upper.expand_as(self.uav_positions))
+        self.uav_positions.clamp_(min=0.)
+        for i in range(3): self.uav_positions[:, i].clamp_(max=self.size[i])
         return penalty
 
     def _check_collisions_torch(self):
+        """Checks for collisions between any pair of UAVs."""
         penalty = 0.0
         for uav1_idx, uav2_idx in combinations(range(self.num_uavs), 2):
             dist = torch.linalg.norm(self.uav_positions[uav1_idx] - self.uav_positions[uav2_idx])
             if dist < self.collision_threshold:
-                penalty -= 1.0; self.collision_count += 1
+                penalty -= 1.0
+                self.collision_count += 1
         return penalty
 
     def _calculate_secure_rate_torch(self, collector_pos, iotd_pos):
-        jammer_pos = self.uav_positions[2]
+        """Calculates the secure communication rate from an IoT device to a collector."""
+        jammer_pos = self.uav_positions[2] # Assumes the 3rd UAV is the jammer
         get_gain = lambda p1, p2: self.beta_0 / (torch.sum((p1-p2)**2) + 1e-9)
+        
         sig_main = self.P_tx_IoTD * get_gain(iotd_pos, collector_pos)
         inter_main = self.P_jammer * get_gain(jammer_pos, collector_pos) + self.noise_power
         rate_main = torch.log2(1.0 + sig_main / inter_main)
+        
         sig_eve = self.P_tx_IoTD * get_gain(iotd_pos, self.eavesdropper_pos)
         inter_eve = self.P_jammer * get_gain(jammer_pos, self.eavesdropper_pos) + self.noise_power
         rate_eve = torch.log2(1.0 + sig_eve / inter_eve)
+        
         return torch.clamp(rate_main - rate_eve, min=0.0)
 
-# --- Plotting and Visualization (Unchanged) ---
+
 def plot_and_save_results(log_df, filename="masac_training_performance.png"):
-    fig, axs = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
-    fig.suptitle('MASAC with Gaussian Actor Training Performance', fontsize=18)
-    axs[0].plot(log_df['episode'], log_df['reward'], color='green'); axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward"); axs[0].grid(True)
-    axs[1].plot(log_df['episode'], log_df['avg_critic_loss'], color='red'); axs[1].set_title("Average Critic Loss"); axs[1].set_ylabel("Loss"); axs[1].grid(True)
-    axs[2].plot(log_df['episode'], log_df['avg_actor_loss'], color='blue'); axs[2].set_title("Average Actor Loss"); axs[2].set_ylabel("Loss"); axs[2].grid(True)
-    axs[3].plot(log_df['episode'], log_df['avg_propulsion_energy'], color='purple'); axs[3].set_title("Average Propulsion Energy"); axs[3].set_ylabel("Energy"); axs[3].grid(True)
-    axs[4].plot(log_df['episode'], log_df['avg_sum_aoi'], color='orange'); axs[4].set_title("Average Sum of AoI"); axs[4].set_ylabel("AoI"); axs[4].grid(True)
-    axs[5].plot(log_df['episode'], log_df['avg_uav_energy'], color='cyan', label='Avg UAV Energy')
-    axs[5].plot(log_df['episode'], log_df['avg_iot_energy'], color='magenta', label='Avg IoT Energy')
-    axs[5].set_title("Average Energy Levels"); axs[5].set_ylabel("Energy Level (0-1)"); axs[5].grid(True); axs[5].legend()
-    axs[6].plot(log_df['episode'], log_df['total_collisions'], color='brown'); axs[6].set_title("Total Collisions per Episode"); axs[6].set_ylabel("Count"); axs[6].set_xlabel("Episode"); axs[6].grid(True)
+    fig, axs = plt.subplots(6, 1, figsize=(12, 30), sharex=True)
+    fig.suptitle('MASAC with LLM Guidance Training Performance', fontsize=18)
+
+    axs[0].plot(log_df['episode'], log_df['reward'], color='green')
+    axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward")
+    axs[0].grid(True)
+    axs[1].plot(log_df['episode'], log_df['avg_critic_loss'], color='red')
+    axs[1].set_title("Average Critic Loss"); axs[1].set_ylabel("Loss")
+    axs[1].grid(True)
+    axs[2].plot(log_df['episode'], log_df['avg_actor_loss'], color='blue')
+    axs[2].set_title("Average Actor Loss"); axs[2].set_ylabel("Loss")
+    axs[2].grid(True)
+    axs[3].plot(log_df['episode'], log_df['avg_propulsion_energy'], color='purple')
+    axs[3].set_title("Average Propulsion Energy"); axs[3].set_ylabel("Energy")
+    axs[3].grid(True)
+    axs[4].plot(log_df['episode'], log_df['avg_sum_aoi'], color='orange')
+    axs[4].set_title("Average Sum of AoI")
+    axs[4].set_ylabel("AoI")
+    axs[5].plot(log_df['episode'], log_df['total_collisions'], color='black')
+    axs[5].set_title("Total Collisions per Episode")
+    axs[5].set_ylabel("Collisions")
+    axs[5].set_xlabel("Episode"); axs[5].grid(True)
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
     print(f"\nPlots saved to {os.path.abspath(filename)}")
 
-def visualize_episode(episode_history, env_params, filename="uav_flight_paths_sac.png"):
-    fig = plt.figure(figsize=(12, 10)); ax = fig.add_subplot(111, projection='3d')
-    iot_pos = env_params['iotd_position'].cpu().numpy(); eve_pos = env_params['eavesdropper_pos'].cpu().numpy()
-    ax.scatter(iot_pos[:,0],iot_pos[:,1],iot_pos[:,2], c='blue', marker='o', s=100, label='IoT Devices')
-    ax.scatter(eve_pos[0], eve_pos[1], eve_pos[2], c='red', marker='x', s=150, label='Eavesdropper')
-    num_uavs = episode_history[0]['uav_positions'].shape[0]
-    uav_trajectories = [[] for _ in range(num_uavs)]
-    for step_data in episode_history:
-        for i in range(num_uavs): uav_trajectories[i].append(step_data['uav_positions'][i])
-    colors = ['orange', 'magenta', 'yellow']
-    for i in range(num_uavs):
-        path = np.array(uav_trajectories[i])
-        ax.plot(path[:,0], path[:,1], path[:,2], color=colors[i], label=f'UAV {i+1} Path')
-        ax.scatter(path[0,0],path[0,1],path[0,2], color='green', marker='s', s=100, label=f'UAV {i+1} Start' if i==0 else "")
-        ax.scatter(path[-1,0],path[-1,1],path[-1,2], color='black', marker='*', s=150, label=f'UAV {i+1} End' if i==0 else "")
-    final_assignments = episode_history[-1]['assignments']; final_uav_pos = episode_history[-1]['uav_positions']
-    for uav_idx, iot_idx in final_assignments:
-        uav_p, iot_p = final_uav_pos[uav_idx], iot_pos[iot_idx]
-        ax.plot([uav_p[0], iot_p[0]], [uav_p[1], iot_p[1]], [uav_p[2], iot_p[2]], 'k--')
-    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z (Altitude)'); ax.set_title('UAV Flight Paths')
-    size = env_params['size'].cpu().numpy()
-    ax.set_xlim(0, size[0]); ax.set_ylim(0, size[1]); ax.set_zlim(0, size[2])
-    ax.legend(); ax.grid(True); plt.savefig(filename); plt.close()
-    print(f"\nEpisode visualization saved to {os.path.abspath(filename)}")
-
-# --- MODIFIED: Constants and Hyperparameters for SAC ---
-config = {
-    'seed': 12345, 'max_episodes': 3000, 'replay_size': 100000, 'gamma': 0.99,
-    'tau': 0.005, 'lr': 3e-4, 'hidden_size': 256, 'batch_size': 128, 'start_steps': 2000,
-    'alpha': 0.2, # Initial alpha value (temperature)
-    'target_update_interval': 1, # How often to update target networks
-}
-
 def main():
-    env = MultiAgentEnv()
+    env = MultiAgentEnv(num_uavs=3)
     torch.manual_seed(config['seed']); np.random.seed(config['seed'])
 
-    # --- MODIFIED: Instantiate MASAC agent ---
     agent = MASAC(
-        num_agents=env.num_agents, 
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0], 
-        hidden_dim=config['hidden_size'],
-        max_action=env.action_space.high[0], 
+        global_state_dim=env.observation_space.shape[0],
+        action_spaces=env.action_spaces,
+        num_agents=env.num_agents,
         args=config
     )
-
-    # Replay buffer initialization remains the same
-    total_action_dim = env.num_agents * env.action_space.shape[0]
-    memory = ReplayBuffer(
-        state_dim=env.observation_space.shape[0],
-        action_dim=total_action_dim,
-        capacity=config['replay_size'],
-        device=DEVICE,
-        prioritized=True 
-    )
-    
-    total_numsteps = 0; training_logs = []
-
-    # Parameters for Prioritized Replay Beta Annealing
-    beta_start = 0.4
-    beta_frames = config['max_episodes'] * env.T
-    beta = beta_start
+    memory = ReplayBuffer(config['replay_size'])
+    total_numsteps = 0
+    training_logs = []
 
     for i_episode in range(config['max_episodes']):
         obs, _ = env.reset(seed=config['seed'] + i_episode)
-        episode_reward, episode_steps = 0, 0; done = False
-        episode_critic_losses, episode_actor_losses, episode_alpha_losses = [], [], []
-        episode_propulsion_energy, episode_sum_aoi = [], []
-        episode_uav_energy, episode_iot_energy, episode_collisions = [], [], 0
+        episode_reward, episode_steps, done = 0, 0, False
+        
+        episode_critic_losses, episode_actor_losses = [], []
+        episode_propulsion_energy, episode_sum_aoi, episode_collisions = [], [], []
 
         while not done:
             if config['start_steps'] > total_numsteps:
-                actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
+                # Warm-up phase: purely random actions
+                actions = np.array([space.sample() for space in env.action_spaces])
             else:
-                actions = agent.select_action(obs)
+                if np.random.rand() < config['epsilon']:
+                    # ε chance → exploration (random action for each agent)
+                    actions = np.array([space.sample() for space in env.action_spaces])
+                else:
+                    # 1-ε chance → exploitation (policy action)
+                    actions = agent.select_actions(obs)
             
             next_obs, reward, terminated, truncated, info = env.step(actions)
             done = terminated or truncated
-
-            # Push to replay buffer (unchanged)
-            flat_state = torch.tensor(obs[0], dtype=torch.float32)
-            flat_next_state = torch.tensor(next_obs[0], dtype=torch.float32)
-            flat_actions = torch.tensor(actions.reshape(-1), dtype=torch.float32)
-            reward_tensor = torch.tensor([reward], dtype=torch.float32)
-            done_tensor = torch.tensor([done], dtype=torch.float32)
-            memory.push(flat_state, flat_actions, reward_tensor, flat_next_state, done_tensor)
-
-            if total_numsteps > config['batch_size']*5:
-                # Update beta for PER
-                beta = min(1.0, beta_start + total_numsteps * (1.0 - beta_start) / beta_frames)
-                # --- MODIFIED: Call MASAC update ---
-                critic_loss, actor_loss, alpha_loss = agent.update_parameters(memory, beta)
-                if critic_loss is not None: episode_critic_losses.append(critic_loss)
-                if actor_loss is not None: episode_actor_losses.append(actor_loss)
-                if alpha_loss is not None: episode_alpha_losses.append(alpha_loss)
+            
+            global_state = env._get_global_state()
+            next_global_state = env._get_global_state()
+            memory.push(global_state, actions.flatten(), reward, next_global_state, done)
+            if total_numsteps > config['batch_size']*5: 
+                critic_loss, actor_losses = agent.update_parameters(memory)
+                if critic_loss is not None:
+                    episode_critic_losses.append(critic_loss)
+                    episode_actor_losses.extend(actor_losses)
 
             episode_propulsion_energy.append(info['propulsion_energy'])
             episode_sum_aoi.append(info['sum_AoI'])
-            episode_uav_energy.append(info['avg_uav_energy'])
-            episode_iot_energy.append(info['avg_iot_energy'])
-            episode_collisions = info['collisions']
-            obs = next_obs; episode_steps += 1; total_numsteps += 1; episode_reward += reward
-
+            
+            obs = next_obs
+            episode_steps += 1
+            total_numsteps += 1
+            episode_reward += reward
+        
+        episode_collisions.append(info['collisions'])
         critic_loss_mean = np.mean(episode_critic_losses) if episode_critic_losses else -1
-        actor_loss_mean = np.mean(episode_actor_losses) if episode_actor_losses else -1
+        actor_loss_mean = np.mean([v for v in episode_actor_losses if v is not None]) if episode_actor_losses else -1
+        
         log_entry = {
-            'episode': i_episode + 1, 'reward': episode_reward/100, 
-            'avg_critic_loss': critic_loss_mean, 'avg_actor_loss': actor_loss_mean, 
+            'episode': i_episode + 1, 'reward': episode_reward,
+            'avg_critic_loss': critic_loss_mean, 'avg_actor_loss': actor_loss_mean,
             'avg_propulsion_energy': np.mean(episode_propulsion_energy),
             'avg_sum_aoi': np.mean(episode_sum_aoi),
-            'avg_uav_energy': np.mean(episode_uav_energy),
-            'avg_iot_energy': np.mean(episode_iot_energy),
-            'total_collisions': episode_collisions
+            'total_collisions': np.sum(episode_collisions)
         }
         training_logs.append(log_entry)
-        print(f"E: {i_episode+1}, R: {episode_reward/100:.2f}, EGY: {np.mean(episode_propulsion_energy):.2f}, AoI: {np.mean(episode_sum_aoi):.2f}, CL: {critic_loss_mean:.4f}, AL: {actor_loss_mean:.4f}")
+
+        print(f"E: {i_episode+1}, R: {episode_reward/100:.2f}, Energy: {np.mean(episode_propulsion_energy):.2f}, "
+              f"AoI: {np.mean(episode_sum_aoi):.2f}, Collisions: {np.sum(episode_collisions)}, "
+              f"CL: {critic_loss_mean:.4f}, AL: {actor_loss_mean:.4f}")
+        config['epsilon'] = max(config['epsilon'] * config['epsilon_decay'], config['epsilon_min'])
+
 
     env.close()
-    log_df = pd.DataFrame(training_logs)
-    log_df.to_csv('masac_training_logs.csv', index=False)
-    plot_and_save_results(log_df)
 
-    print("\nRunning final episode for visualization...")
-    obs, _ = env.reset(); done = False; episode_history = []
-    while not done:
-        actions = agent.select_action(obs, evaluate=True) # Use deterministic actions for visualization
-        next_obs, _, terminated, truncated, _ = env.step(actions)
-        done = terminated or truncated
-        episode_history.append({'uav_positions': env.uav_positions.cpu().numpy(), 'assignments': env.current_assignments})
-        obs = next_obs
-    visualize_episode(episode_history, {'iotd_position':env.iotd_position, 'eavesdropper_pos':env.eavesdropper_pos, 'size':env.size})
+    log_df = pd.DataFrame(training_logs)
+    csv_filename = 'masac_llm_training_logs.csv'
+    log_df.to_csv(csv_filename, index=False)
+    print(f"\nTraining logs saved to {os.path.abspath(csv_filename)}")
+    plot_and_save_results(log_df)
 
 if __name__ == '__main__':
     main()
