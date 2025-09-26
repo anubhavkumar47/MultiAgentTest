@@ -44,7 +44,7 @@ class ReplayBuffer:
 
     def push(self, state, action, reward, next_state, done):
         """Add transition to buffer"""
-        
+
         self.states[self.ptr] = state.cpu().numpy()
         self.actions[self.ptr] = action.cpu().numpy()
         self.rewards[self.ptr] = reward.cpu().numpy()
@@ -238,10 +238,10 @@ class MATD3:
         self.total_it = 0
         self.actors = [DiffusionActor(state_dim, action_dim, hidden_dim, max_action, device=self.device) for _ in range(num_agents)]
         self.actors_target = [copy.deepcopy(actor) for actor in self.actors]
-        self.actors_optimizer = [optim.Adam(actor.parameters(), lr=args['lr']) for actor in self.actors]
+        self.actors_optimizer = [optim.Adam(actor.parameters(), lr=0.0004) for actor in self.actors]
         self.critic = TransformerCritic(num_agents, state_dim, action_dim, hidden_dim).to(self.device)
         self.critic_target = copy.deepcopy(self.critic)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args['lr'])
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.0003)
 
     def select_action(self, states):
         states = [torch.FloatTensor(s).to(self.device) for s in states]
@@ -260,7 +260,7 @@ class MATD3:
 
         # --- FIX: Unpack new items (indices, weights) from the prioritized buffer ---
         state_batch, action_batch, reward_batch, next_state_batch, done_batch, indices, weights = memory.sample(config['batch_size'], beta)
-        
+
         # Normalization (remains the same)
         reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-8)
         state_batch = (state_batch - state_batch.mean()) / (state_batch.std() + 1e-8)
@@ -289,7 +289,7 @@ class MATD3:
         # --- FIX: Update priorities in the replay buffer ---
         td_errors = (torch.min(critic_loss_1, critic_loss_2)).detach().squeeze()
         memory.update_priorities(indices, td_errors)
-        
+
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
@@ -468,9 +468,11 @@ def visualize_episode(episode_history, env_params, filename="uav_flight_paths.pn
 
 # --- Constants and Hyperparameters ---
 config = {
-    'seed': 12345, 'max_episodes': 3000, 'replay_size': 100000, 'gamma': 0.99,
-    'tau': 0.005, 'lr': 1e-4, 'hidden_size': 256, 'batch_size': 128, 'start_steps': 2000,
-    'policy_noise': 0.2, 'noise_clip': 0.5, 'policy_freq': 2
+    'seed': 12345, 'max_episodes': 1000, 'replay_size': 1000000, 'gamma': 0.99,
+    'tau': 0.001, 'lr': 1e-4, 'hidden_size': 256, 'batch_size': 512, 'start_steps': 2000,
+    'policy_noise': 0.2, 'noise_clip': 0.5, 'policy_freq': 2,'epsilon': 0.1,         # 10% random exploration
+    'epsilon_decay': 0.995, # optional: decay per episode
+    'epsilon_min': 0.01
 }
 
 def main():
@@ -478,11 +480,11 @@ def main():
     torch.manual_seed(config['seed']); np.random.seed(config['seed'])
 
     agent = MATD3(
-        num_agents=env.num_agents, 
+        num_agents=env.num_agents,
         state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0], 
+        action_dim=env.action_space.shape[0],
         hidden_dim=config['hidden_size'],
-        max_action=env.action_space.high[0], 
+        max_action=env.action_space.high[0],
         args=config
     )
 
@@ -496,7 +498,7 @@ def main():
         device=DEVICE,
         prioritized=True # Enable the new functionality
     )
-    
+
     total_numsteps = 0; training_logs = []
 
     # --- NEW: Parameters for Prioritized Replay Beta Annealing ---
@@ -515,7 +517,12 @@ def main():
             if config['start_steps'] > total_numsteps:
                 actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
             else:
-                actions = agent.select_action(obs)
+              if np.random.rand() < config['epsilon']:
+                    # ε chance → exploration (random action for each agent)
+                    actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
+              else:
+                    # 1-ε chance → exploitation (policy action)
+                    actions = agent.select_action(obs)
             next_obs, reward, terminated, truncated, info = env.step(actions)
             done = terminated or truncated
 
@@ -543,9 +550,11 @@ def main():
 
         critic_loss_mean = np.mean(episode_critic_losses) if episode_critic_losses else -1
         actor_loss_mean = np.mean(episode_actor_losses) if episode_actor_losses else -1
+        config['epsilon'] = max(config['epsilon'] * config['epsilon_decay'], config['epsilon_min'])
+
         log_entry = {
-            'episode': i_episode + 1, 'reward': episode_reward/100, 
-            'avg_critic_loss': critic_loss_mean, 'avg_actor_loss': actor_loss_mean, 
+            'episode': i_episode + 1, 'reward': episode_reward/100,
+            'avg_critic_loss': critic_loss_mean, 'avg_actor_loss': actor_loss_mean,
             'avg_propulsion_energy': np.mean(episode_propulsion_energy),
             'avg_sum_aoi': np.mean(episode_sum_aoi),
             'avg_uav_energy': np.mean(episode_uav_energy),
