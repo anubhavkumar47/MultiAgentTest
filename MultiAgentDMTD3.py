@@ -328,7 +328,7 @@ class MultiAgentEnv(gym.Env):
         iot_positions = np.array([[50,50,0],[75,150,0],[100,100,0],[100,250,0],[150,150,0]], dtype=np.float32)
         self.iotd_position = torch.tensor(iot_positions, device=self.device, dtype=torch.float32)
         self.eavesdropper_pos = torch.tensor([150.0, 0.0, 0.0], device=self.device)
-        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.1, 0.5, 0.1, 0.1
+        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.2, 0.5, 0.1, 0.1
         self.eta, self.beta_0, self.noise_power = 0.5, 1e-3, 1e-13
         self.collision_threshold = 5.0
         self.iot_idle_drain_rate = 0.001
@@ -468,7 +468,7 @@ def visualize_episode(episode_history, env_params, filename="uav_flight_paths_ma
 
 # --- Constants and Hyperparameters ---
 config = {
-    'seed': 12345, 'max_episodes': 1000, 'replay_size': 1000000, 'gamma': 0.99,
+    'seed': 12345, 'max_episodes': 1000, 'replay_size': 100000, 'gamma': 0.99,
     'tau': 0.001, 'lr': 1e-4, 'hidden_size': 256, 'batch_size': 512, 'start_steps': 2000,
     'policy_noise': 0.2, 'noise_clip': 0.5, 'policy_freq': 2,'epsilon': 0.1,         # 10% random exploration
     'epsilon_decay': 0.995, # optional: decay per episode
