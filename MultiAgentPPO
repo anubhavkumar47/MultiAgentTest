@@ -1,0 +1,417 @@
+import gymnasium as gym
+from gymnasium.spaces import Box
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Normal
+import numpy as np
+import random
+from collections import deque
+import matplotlib.pyplot as plt
+from itertools import combinations
+import pandas as pd
+import os
+import copy
+
+# --- Constants and Hyperparameters ---
+# Use CUDA if available, otherwise fall back to CPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# MODIFIED: Hyperparameters for PPO
+config = {
+    'seed': 42,
+    'max_episodes': 1000,
+    'update_timestep': 4000, # Timesteps to collect before each update
+    'gamma': 0.99,
+    'lr_actor': 0.0003,
+    'lr_critic': 0.001,
+    'hidden_size': 256,
+    'ppo_epochs': 10,       # Number of epochs for updating policy
+    'eps_clip': 0.2,        # Clip parameter for PPO
+    'gae_lambda': 0.95,     # Lambda for Generalized Advantage Estimation
+}
+
+# --- NEW: Rollout Buffer for On-Policy Data ---
+class RolloutBuffer:
+    """A buffer for storing trajectories for on-policy learning (PPO)."""
+    def __init__(self):
+        self.actions = []
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+
+    def clear(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
+
+# --- LLM Simulator for High-Level Decisions (Unchanged) ---
+class LLM_Simulator:
+    """
+    A simulated LLM to make high-level decisions like adjusting penalties
+    and handling task offloading based on the current environment state.
+    """
+    def __init__(self):
+        self.base_aoi_penalty_weight = 0.01
+        self.base_propulsion_penalty_weight = 0.1
+        print("LLM Simulator Initialized: Ready to provide strategic guidance.")
+
+    def adjust_penalties(self, avg_aoi, uav_propulsion_energy):
+        """Dynamically adjusts penalty weights based on situational context."""
+        aoi_weight = self.base_aoi_penalty_weight
+        energy_weight = self.base_propulsion_penalty_weight
+        if avg_aoi > 40: aoi_weight *= 5
+        if uav_propulsion_energy > 30: energy_weight *= 3
+        return aoi_weight, energy_weight
+
+    def decide_task_offload(self, uav_positions, iotd_positions):
+        """Simulates task offloading by assigning collectors to the nearest IoT devices."""
+        num_collectors = 2
+        distances = torch.cdist(uav_positions[:num_collectors], iotd_positions)
+        assignments, assigned_iots, assigned_uavs = [], set(), set()
+        sorted_distances = []
+        for uav_idx in range(num_collectors):
+            for iot_idx in range(iotd_positions.shape[0]):
+                sorted_distances.append((distances[uav_idx, iot_idx].item(), uav_idx, iot_idx))
+        sorted_distances.sort()
+        for _, uav_idx, iot_idx in sorted_distances:
+            if uav_idx not in assigned_uavs and iot_idx not in assigned_iots:
+                assignments.append((uav_idx, iot_idx))
+                assigned_uavs.add(uav_idx)
+                assigned_iots.add(iot_idx)
+            if len(assignments) == num_collectors: break
+        return assignments
+
+# --- REPLACED: PPO Actor-Critic Networks ---
+class ActorCritic(nn.Module):
+    """PPO Actor-Critic network for a single agent."""
+    def __init__(self, state_dim, action_dim, hidden_dim, action_std_init):
+        super(ActorCritic, self).__init__()
+        # Actor
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Tanh()
+        )
+        self.action_log_std = nn.Parameter(torch.ones(1, action_dim) * action_std_init)
+        
+        # Critic (Value Network)
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self):
+        raise NotImplementedError
+
+    def act(self, state):
+        """Select an action from the policy distribution."""
+        action_mean = self.actor(state)
+        cov_mat = torch.diag(self.action_log_std.exp().flatten())
+        dist = Normal(action_mean, cov_mat)
+
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        return action.detach(), action_logprob.detach()
+
+    def evaluate(self, state, action):
+        """Evaluate a state-action pair, returning logprob, state value, and entropy."""
+        action_mean = self.actor(state)
+        action_var = self.action_log_std.exp().pow(2).expand_as(action_mean)
+        cov_mat = torch.diag_embed(action_var)
+        dist = Normal(action_mean, cov_mat)
+
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_values = self.critic(state)
+
+        return action_logprobs, state_values, dist_entropy
+
+
+# --- REPLACED: Multi-Agent PPO (MAPPO) Agent ---
+class MAPPO:
+    def __init__(self, global_state_dim, action_dims, num_agents, args):
+        self.gamma = args['gamma']
+        self.eps_clip = args['eps_clip']
+        self.ppo_epochs = args['ppo_epochs']
+        self.num_agents = num_agents
+        self.device = DEVICE
+
+        action_std_init = -0.5 # Corresponds to an initial std of ~0.6
+
+        # Create policy and old_policy networks for each agent
+        self.policies = [ActorCritic(global_state_dim, ad, args['hidden_size'], action_std_init).to(self.device) for ad in action_dims]
+        self.optimizers = [optim.Adam(policy.parameters(), lr=args['lr_actor']) for policy in self.policies]
+        self.policies_old = [ActorCritic(global_state_dim, ad, args['hidden_size'], action_std_init).to(self.device) for ad in action_dims]
+        for i in range(num_agents):
+            self.policies_old[i].load_state_dict(self.policies[i].state_dict())
+            
+        self.MseLoss = nn.MSELoss()
+
+    def select_actions(self, states):
+        """Select actions for all agents using the old policy for exploration."""
+        with torch.no_grad():
+            actions = []
+            log_probs = []
+            for i in range(self.num_agents):
+                state = torch.FloatTensor(states[i]).to(self.device)
+                action, log_prob = self.policies_old[i].act(state)
+                actions.append(action.cpu().numpy().flatten())
+                log_probs.append(log_prob.cpu().numpy().flatten())
+        return np.array(actions), np.array(log_probs)
+
+    def update(self, memory):
+        """Update policies for all agents."""
+        # Monte Carlo estimate of returns
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
+        
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
+
+        # Convert list to tensor
+        old_states = torch.squeeze(torch.tensor(np.array(memory.states), dtype=torch.float32).to(self.device), 1)
+        old_actions = torch.squeeze(torch.tensor(np.array(memory.actions), dtype=torch.float32).to(self.device), 1)
+        old_logprobs = torch.squeeze(torch.tensor(np.array(memory.logprobs), dtype=torch.float32).to(self.device), 1)
+        
+        critic_losses, actor_losses = [], []
+
+        # Optimize policy for K epochs
+        for _ in range(self.ppo_epochs):
+            for i in range(self.num_agents):
+                # Evaluating old actions and values
+                logprobs, state_values, dist_entropy = self.policies[i].evaluate(old_states, old_actions[:, i*3:(i+1)*3])
+
+                # Finding the ratio (pi_theta / pi_theta_old)
+                ratios = torch.exp(logprobs.sum(dim=1, keepdim=True) - old_logprobs[:, i*3:(i+1)*3].sum(dim=1, keepdim=True).detach())
+
+                # Finding Surrogate Loss
+                advantages = rewards - state_values.detach()
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+
+                # Final loss of clipped objective PPO
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = self.MseLoss(state_values, rewards)
+                
+                loss = actor_loss + 0.5 * critic_loss - 0.01 * dist_entropy.mean()
+
+                # Take gradient step
+                self.optimizers[i].zero_grad()
+                loss.backward()
+                self.optimizers[i].step()
+
+                actor_losses.append(actor_loss.item())
+                critic_losses.append(critic_loss.item())
+
+        # Copy new weights into old policy
+        for i in range(self.num_agents):
+            self.policies_old[i].load_state_dict(self.policies[i].state_dict())
+            
+        return np.mean(critic_losses), np.mean(actor_losses)
+
+# --- Custom Multi-Agent Environment (Unchanged) ---
+class MultiAgentEnv(gym.Env):
+    def __init__(self, num_uavs=3, num_IoTD=5, T=100):
+        super().__init__()
+        self.device = DEVICE
+        self.num_agents = self.num_uavs = num_uavs
+        self.num_collectors, self.num_IoTD, self.T = 2, num_IoTD, T
+        self.size = torch.tensor([300.0, 300.0, 300.0], device=self.device)
+        iot_positions = np.array([[50,50,0],[75,150,0],[100,100,0],[100,250,0],[150,150,0]], dtype=np.float32)
+        self.iotd_position = torch.tensor(iot_positions, device=self.device, dtype=torch.float32)
+        self.eavesdropper_pos = torch.tensor([150.0, 0.0, 0.0], device=self.device)
+        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.2, 0.5, 0.1, 0.1
+        self.eta, self.beta_0, self.noise_power = 0.5, 1e-3, 1e-13
+        self.collision_threshold = 5.0
+        self.iot_idle_drain_rate = 0.001
+        self.iot_comm_drain_rate = 0.05
+        self.uav_comm_energy_cost = 0.02
+        self.action_spaces = [Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32) for _ in range(self.num_uavs)]
+        obs_shape = (self.num_uavs * 3) + (2 * self.num_IoTD) + self.num_uavs
+        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
+        self.llm = LLM_Simulator()
+        self.current_assignments = []
+        self.reset()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        low = torch.tensor([0.0, 0.0, 100.0], device=self.device)
+        self.uav_positions = low + torch.rand((self.num_uavs, 3), device=self.device) * (self.size - low)
+        self.AoI = torch.zeros(self.num_IoTD, device=self.device)
+        self.iot_energy_levels = torch.ones(self.num_IoTD, device=self.device)
+        self.uav_energy_levels = torch.ones(self.num_uavs, device=self.device)
+        self.time = 0
+        self.collision_count = 0
+        return self._get_obs(), {}
+
+    def _get_global_state(self):
+        return torch.cat([
+            self.uav_positions.flatten(), self.AoI, self.iot_energy_levels, self.uav_energy_levels
+        ]).detach().cpu().numpy()
+
+    def _get_obs(self):
+        global_state = self._get_global_state()
+        return [global_state for _ in range(self.num_agents)]
+
+    def step(self, actions):
+        # Action is now scaled inside the actor's tanh layer, so no need for max_action scaling here
+        actions_t = torch.from_numpy(actions).to(self.device).float()
+        self.time += 1
+        self.AoI += 1.0
+        self.iot_energy_levels -= self.iot_idle_drain_rate
+        self.iot_energy_levels.clamp_(min=0.0)
+        past_positions = self.uav_positions.clone()
+        self.uav_positions += actions_t * 20.0 # Action scaling factor
+        collision_penalty = self._check_collisions_torch()
+        boundary_penalty = self._check_boundaries_torch()
+        propulsion_energy = torch.sum(torch.linalg.norm(self.uav_positions - past_positions, dim=1))
+        avg_aoi = torch.mean(self.AoI).item()
+        aoi_penalty_weight, energy_penalty_weight = self.llm.adjust_penalties(avg_aoi, propulsion_energy.item())
+        if self.time % 25 == 0 or not self.current_assignments:
+            self.current_assignments = self.llm.decide_task_offload(self.uav_positions, self.iotd_position)
+        reward_success, reward_fail = 0.0, 0.0
+        for uav_idx, iot_idx in self.current_assignments:
+            if self.uav_energy_levels[uav_idx] < self.uav_comm_energy_cost:
+                reward_fail -= 0.5; continue
+            collector_uav_pos = self.uav_positions[uav_idx]
+            dist_UAV_IoTD = torch.linalg.norm(collector_uav_pos - self.iotd_position[iot_idx])
+            energy_harvested = self.P_tx_UAV * (self.beta_0 / (dist_UAV_IoTD**2 + 1e-9)) * self.eta
+            self.iot_energy_levels[iot_idx] += energy_harvested
+            if self.iot_energy_levels[iot_idx] >= self.iot_comm_drain_rate:
+                self.iot_energy_levels[iot_idx] -= self.iot_comm_drain_rate
+                secure_rate = self._calculate_secure_rate_torch(collector_uav_pos, self.iotd_position[iot_idx])
+                if secure_rate > self.R_min:
+                    reward_success += 10.0; self.AoI[iot_idx] = 0.0
+                else: reward_fail -= 1.0
+            else: reward_fail -= 1.0
+            self.uav_energy_levels[uav_idx] -= self.uav_comm_energy_cost
+        self.iot_energy_levels.clamp_(min=0.0, max=1.0)
+        self.uav_energy_levels.clamp_(min=0.0, max=1.0)
+        aoi_penalty = -aoi_penalty_weight * torch.mean(self.AoI).item()
+        energy_penalty = -energy_penalty_weight * propulsion_energy.item()
+        reward = reward_success + reward_fail + aoi_penalty + energy_penalty + collision_penalty + boundary_penalty
+        terminated = self.time >= self.T
+        info = {'propulsion_energy': propulsion_energy.item(), 'sum_AoI': torch.sum(self.AoI).item(), 'collisions': self.collision_count, 'avg_iot_energy': torch.mean(self.iot_energy_levels).item(), 'avg_uav_energy': torch.mean(self.uav_energy_levels).item()}
+        return self._get_obs(), reward, terminated, False, info
+
+    def _check_boundaries_torch(self):
+        lower, upper = torch.tensor([0.,0.,0.], device=self.device), self.size
+        out_of_bounds = torch.any((self.uav_positions < lower) | (self.uav_positions > upper), dim=1)
+        penalty = -1.0 * torch.sum(out_of_bounds).item()
+        self.uav_positions.clamp_(min=0.)
+        for i in range(3): self.uav_positions[:, i].clamp_(max=self.size[i])
+        return penalty
+
+    def _check_collisions_torch(self):
+        penalty = 0.0
+        for uav1_idx, uav2_idx in combinations(range(self.num_uavs), 2):
+            dist = torch.linalg.norm(self.uav_positions[uav1_idx] - self.uav_positions[uav2_idx])
+            if dist < self.collision_threshold:
+                penalty -= 1.0; self.collision_count += 1
+        return penalty
+
+    def _calculate_secure_rate_torch(self, collector_pos, iotd_pos):
+        jammer_pos = self.uav_positions[2]
+        get_gain = lambda p1, p2: self.beta_0 / (torch.sum((p1-p2)**2) + 1e-9)
+        sig_main = self.P_tx_IoTD * get_gain(iotd_pos, collector_pos); inter_main = self.P_jammer * get_gain(jammer_pos, collector_pos) + self.noise_power
+        rate_main = torch.log2(1.0 + sig_main / inter_main)
+        sig_eve = self.P_tx_IoTD * get_gain(iotd_pos, self.eavesdropper_pos); inter_eve = self.P_jammer * get_gain(jammer_pos, self.eavesdropper_pos) + self.noise_power
+        rate_eve = torch.log2(1.0 + sig_eve / inter_eve)
+        return torch.clamp(rate_main - rate_eve, min=0.0)
+
+# MODIFIED: Plotting function for PPO
+def plot_and_save_results(log_df, filename="mappo_training_performance.png"):
+    fig, axs = plt.subplots(6, 1, figsize=(12, 30), sharex=True)
+    fig.suptitle('MAPPO with LLM Guidance Training Performance', fontsize=18)
+    axs[0].plot(log_df['episode'], log_df['reward'], color='green'); axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward"); axs[0].grid(True)
+    axs[1].plot(log_df['episode'], log_df['avg_critic_loss'], color='red'); axs[1].set_title("Average Critic Loss"); axs[1].set_ylabel("Loss"); axs[1].grid(True)
+    axs[2].plot(log_df['episode'], log_df['avg_actor_loss'], color='blue'); axs[2].set_title("Average Actor Loss"); axs[2].set_ylabel("Loss"); axs[2].grid(True)
+    axs[3].plot(log_df['episode'], log_df['avg_propulsion_energy'], color='purple'); axs[3].set_title("Average Propulsion Energy"); axs[3].set_ylabel("Energy"); axs[3].grid(True)
+    axs[4].plot(log_df['episode'], log_df['avg_sum_aoi'], color='orange'); axs[4].set_title("Average Sum of AoI"); axs[4].set_ylabel("AoI"); axs[4].grid(True)
+    axs[5].plot(log_df['episode'], log_df['total_collisions'], color='black'); axs[5].set_title("Total Collisions per Episode"); axs[5].set_ylabel("Collisions"); axs[5].set_xlabel("Episode"); axs[5].grid(True)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
+    print(f"\nPlots saved to {os.path.abspath(filename)}")
+
+# MODIFIED: Main training loop for PPO
+def main():
+    env = MultiAgentEnv(num_uavs=3)
+    torch.manual_seed(config['seed']); np.random.seed(config['seed'])
+    action_dims = [space.shape[0] for space in env.action_spaces]
+    agent = MAPPO(
+        global_state_dim=env.observation_space.shape[0],
+        action_dims=action_dims,
+        num_agents=env.num_agents,
+        args=config
+    )
+    memory = RolloutBuffer()
+    time_step = 0
+    training_logs = []
+
+    for i_episode in range(1, config['max_episodes'] + 1):
+        obs, _ = env.reset(seed=config['seed'] + i_episode)
+        episode_reward, done = 0, False
+        episode_propulsion_energy, episode_sum_aoi, episode_collisions = [], [], []
+        critic_loss_val, actor_loss_val = -1, -1
+
+        while not done:
+            time_step +=1
+            actions, log_probs = agent.select_actions(obs)
+            next_obs, reward, terminated, truncated, info = env.step(actions)
+            done = terminated or truncated
+
+            # Saving reward and is_terminals:
+            memory.rewards.append(reward)
+            memory.is_terminals.append(done)
+            memory.states.append(obs)
+            memory.actions.append(actions)
+            memory.logprobs.append(log_probs)
+
+            # Update if it's time
+            if time_step % config['update_timestep'] == 0:
+                critic_loss_val, actor_loss_val = agent.update(memory)
+                memory.clear()
+
+            episode_propulsion_energy.append(info['propulsion_energy'])
+            episode_sum_aoi.append(info['sum_AoI'])
+            episode_reward += reward
+            obs = next_obs
+
+        episode_collisions.append(info['collisions'])
+        log_entry = {
+            'episode': i_episode, 'reward': episode_reward,
+            'avg_critic_loss': critic_loss_val, 'avg_actor_loss': actor_loss_val,
+            'avg_propulsion_energy': np.mean(episode_propulsion_energy),
+            'avg_sum_aoi': np.mean(episode_sum_aoi),
+            'total_collisions': np.sum(episode_collisions)
+        }
+        training_logs.append(log_entry)
+
+        print(f"E: {i_episode}, R: {episode_reward/100:.2f}, Energy: {np.mean(episode_propulsion_energy):.2f}, "
+              f"AoI: {np.mean(episode_sum_aoi):.2f}, Collisions: {np.sum(episode_collisions)}, "
+              f"CL: {critic_loss_val:.4f}, AL: {actor_loss_val:.4f}")
+
+    env.close()
+    log_df = pd.DataFrame(training_logs)
+    csv_filename = 'mappo_llm_training_logs.csv'
+    log_df.to_csv(csv_filename, index=False)
+    print(f"\nTraining logs saved to {os.path.abspath(csv_filename)}")
+    plot_and_save_results(log_df)
+
+if __name__ == '__main__':
+    main()
