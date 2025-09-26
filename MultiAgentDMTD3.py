@@ -426,7 +426,7 @@ class MultiAgentEnv(gym.Env):
         return torch.clamp(rate_main - rate_eve, min=0.0)
 
 # --- Plotting and Visualization ---
-def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
+def plot_and_save_results(log_df, filename="madmtd3_training_performance.png"):
     fig, axs = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
     fig.suptitle('MATD3 with Diffusion Actor Training Performance', fontsize=18)
     axs[0].plot(log_df['episode'], log_df['reward'], color='green'); axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward"); axs[0].grid(True)
@@ -441,7 +441,7 @@ def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
     plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
     print(f"\nPlots saved to {os.path.abspath(filename)}")
 
-def visualize_episode(episode_history, env_params, filename="uav_flight_paths.png"):
+def visualize_episode(episode_history, env_params, filename="uav_flight_paths_madmtd3.png"):
     fig = plt.figure(figsize=(12, 10)); ax = fig.add_subplot(111, projection='3d')
     iot_pos = env_params['iotd_position'].cpu().numpy(); eve_pos = env_params['eavesdropper_pos'].cpu().numpy()
     ax.scatter(iot_pos[:,0],iot_pos[:,1],iot_pos[:,2], c='blue', marker='o', s=100, label='IoT Devices')
