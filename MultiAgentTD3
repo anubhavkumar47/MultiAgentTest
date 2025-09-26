@@ -1,0 +1,440 @@
+import gymnasium as gym
+from gymnasium.spaces import Box
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import random
+from collections import deque
+import matplotlib.pyplot as plt
+from itertools import combinations
+import pandas as pd
+import os
+import copy
+
+# --- Constants and Hyperparameters ---
+# Use CUDA if available, otherwise fall back to CPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# MODIFIED: Hyperparameters for TD3
+config = {
+    'seed': 42,
+    'start_steps': 2500,
+    'max_episodes': 1000,
+    'replay_size': 100000,
+    'gamma': 0.99,
+    'tau': 0.005,
+    'lr_actor': 0.0004,
+    'lr_critic': 0.0003,
+    'hidden_size': 256,
+    'batch_size': 256,
+    'policy_freq': 2,        # Delayed policy update frequency
+    'policy_noise': 0.2,     # Noise added to target policy during critic update
+    'noise_clip': 0.5,       # Range to clip target policy noise
+    'exploration_noise': 0.1 # Std of Gaussian exploration noise
+}
+
+# --- Replay Buffer (Unchanged) ---
+class ReplayBuffer:
+    """A replay buffer for storing multi-agent experiences."""
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, global_state, actions, reward, next_global_state, done):
+        """Saves a transition for the entire multi-agent system."""
+        self.buffer.append((global_state, actions, reward, next_global_state, done))
+
+    def sample(self, batch_size):
+        global_state, actions, reward, next_global_state, done = zip(*random.sample(self.buffer, batch_size))
+        return np.array(global_state), np.array(actions), np.array(reward), np.array(next_global_state), np.array(done)
+
+    def __len__(self):
+        return len(self.buffer)
+
+# --- LLM Simulator for High-Level Decisions (Unchanged) ---
+class LLM_Simulator:
+    """
+    A simulated LLM to make high-level decisions like adjusting penalties
+    and handling task offloading based on the current environment state.
+    """
+    def __init__(self):
+        self.base_aoi_penalty_weight = 0.01
+        self.base_propulsion_penalty_weight = 0.1
+        print("LLM Simulator Initialized: Ready to provide strategic guidance.")
+
+    def adjust_penalties(self, avg_aoi, uav_propulsion_energy):
+        """Dynamically adjusts penalty weights based on situational context."""
+        aoi_weight = self.base_aoi_penalty_weight
+        energy_weight = self.base_propulsion_penalty_weight
+        if avg_aoi > 40: aoi_weight *= 5
+        if uav_propulsion_energy > 30: energy_weight *= 3
+        return aoi_weight, energy_weight
+
+    def decide_task_offload(self, uav_positions, iotd_positions):
+        """Simulates task offloading by assigning collectors to the nearest IoT devices."""
+        num_collectors = 2
+        distances = torch.cdist(uav_positions[:num_collectors], iotd_positions)
+        assignments, assigned_iots, assigned_uavs = [], set(), set()
+        sorted_distances = []
+        for uav_idx in range(num_collectors):
+            for iot_idx in range(iotd_positions.shape[0]):
+                sorted_distances.append((distances[uav_idx, iot_idx].item(), uav_idx, iot_idx))
+        sorted_distances.sort()
+        for _, uav_idx, iot_idx in sorted_distances:
+            if uav_idx not in assigned_uavs and iot_idx not in assigned_iots:
+                assignments.append((uav_idx, iot_idx))
+                assigned_uavs.add(uav_idx)
+                assigned_iots.add(iot_idx)
+            if len(assignments) == num_collectors: break
+        return assignments
+
+# --- REPLACED: Deterministic Actor Network for TD3 ---
+class Actor(nn.Module):
+    """Deterministic Actor Network for an individual agent."""
+    def __init__(self, num_inputs, num_actions, hidden_dim, action_space):
+        super(Actor, self).__init__()
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean_linear = nn.Linear(hidden_dim, num_actions)
+        self.max_action = action_space.high[0]
+
+    def forward(self, state):
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        # Use tanh to bound the action between -1 and 1, then scale to the action space
+        action = self.max_action * torch.tanh(self.mean_linear(x))
+        return action
+
+# --- Centralized Critic Network (Unchanged) ---
+class CentralizedCritic(nn.Module):
+    """Twin Q-Network Critic that takes the global state and joint actions."""
+    def __init__(self, global_state_dim, joint_action_dim, hidden_dim):
+        super(CentralizedCritic, self).__init__()
+        input_dim = global_state_dim + joint_action_dim
+        # Q1 architecture
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+        # Q2 architecture
+        self.linear4 = nn.Linear(input_dim, hidden_dim)
+        self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear6 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, global_state, joint_action):
+        xu = torch.cat([global_state, joint_action], 1)
+        x1 = F.relu(self.linear1(xu)); x1 = F.relu(self.linear2(x1)); q1 = self.linear3(x1)
+        x2 = F.relu(self.linear4(xu)); x2 = F.relu(self.linear5(x2)); q2 = self.linear6(x2)
+        return q1, q2
+
+    def Q1(self, global_state, joint_action):
+        """Returns the value from the first Q-network only (for actor update)."""
+        xu = torch.cat([global_state, joint_action], 1)
+        x1 = F.relu(self.linear1(xu)); x1 = F.relu(self.linear2(x1)); q1 = self.linear3(x1)
+        return q1
+
+
+# --- REPLACED: Multi-Agent TD3 (MATD3) Agent ---
+class MATD3(object):
+    def __init__(self, global_state_dim, action_spaces, num_agents, args):
+        self.gamma = args['gamma']; self.tau = args['tau']
+        self.policy_freq = args['policy_freq']
+        self.policy_noise = args['policy_noise']
+        self.noise_clip = args['noise_clip']
+        self.batch_size = args['batch_size']
+        self.num_agents = num_agents
+        self.device = DEVICE
+        self.total_it = 0
+        print(f"Training on device: {self.device}")
+
+        joint_action_dim = sum(space.shape[0] for space in action_spaces)
+
+        # Centralized Critic
+        self.critic = CentralizedCritic(global_state_dim, joint_action_dim, args['hidden_size']).to(self.device)
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=args['lr_critic'])
+        self.critic_target = copy.deepcopy(self.critic)
+
+        # Decentralized Actors
+        self.actors = [Actor(global_state_dim, space.shape[0], args['hidden_size'], space).to(self.device) for space in action_spaces]
+        self.actor_optims = [optim.Adam(actor.parameters(), lr=args['lr_actor']) for actor in self.actors]
+        self.actors_target = [copy.deepcopy(actor) for actor in self.actors]
+
+    def select_actions(self, states, exploration_noise=0.1):
+        actions = []
+        with torch.no_grad():
+            for i in range(self.num_agents):
+                state = torch.FloatTensor(states[i]).to(self.device).unsqueeze(0)
+                action = self.actors[i](state).cpu().data.numpy().flatten()
+                # Add exploration noise
+                noise = np.random.normal(0, self.actors[i].max_action * exploration_noise, size=action.shape)
+                action = (action + noise).clip(-self.actors[i].max_action, self.actors[i].max_action)
+                actions.append(action)
+        return np.array(actions)
+
+    def update_parameters(self, memory):
+        self.total_it += 1
+        if len(memory) < self.batch_size:
+            return None, None
+
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(self.batch_size)
+
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+        done_batch = torch.FloatTensor(1 - done_batch).to(self.device).unsqueeze(1)
+        
+        # --- Update Critic ---
+        with torch.no_grad():
+            next_actions = []
+            for i in range(self.num_agents):
+                # Target Policy Smoothing: Add noise to target actor actions
+                noise = (torch.randn_like(self.actors_target[i](next_state_batch)) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+                next_action = (self.actors_target[i](next_state_batch) + noise).clamp(-self.actors[i].max_action, self.actors[i].max_action)
+                next_actions.append(next_action)
+
+            joint_next_actions = torch.cat(next_actions, dim=1)
+            qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, joint_next_actions)
+            min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
+            next_q_value = reward_batch + done_batch * self.gamma * min_qf_next_target
+
+        qf1, qf2 = self.critic(state_batch, action_batch)
+        qf_loss = F.mse_loss(qf1, next_q_value) + F.mse_loss(qf2, next_q_value)
+
+        self.critic_optim.zero_grad()
+        qf_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optim.step()
+
+        actor_loss_val = None
+        # --- Delayed Actor and Target Updates ---
+        if self.total_it % self.policy_freq == 0:
+            # --- Update Actors ---
+            actions_pred = []
+            for i in range(self.num_agents):
+                 actions_pred.append(self.actors[i](state_batch))
+            joint_actions_pred = torch.cat(actions_pred, dim=1)
+
+            # Use Q1 from the critic for the actor loss
+            actor_loss = -self.critic.Q1(state_batch, joint_actions_pred).mean()
+            actor_loss_val = actor_loss.item()
+            
+            # Update all actors
+            for optim in self.actor_optims: optim.zero_grad()
+            actor_loss.backward()
+            for optim in self.actor_optims: optim.step()
+            
+            # --- Soft Update Target Networks ---
+            self.soft_update(self.critic_target, self.critic, self.tau)
+            for i in range(self.num_agents):
+                self.soft_update(self.actors_target[i], self.actors[i], self.tau)
+
+        return qf_loss.item(), actor_loss_val
+
+    def soft_update(self, target, source, tau):
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+# --- Custom Multi-Agent Environment (Unchanged) ---
+class MultiAgentEnv(gym.Env):
+    def __init__(self, num_uavs=3, num_IoTD=5, T=100):
+        super().__init__()
+        self.device = DEVICE
+        self.num_agents = self.num_uavs = num_uavs
+        self.num_collectors, self.num_IoTD, self.T = 2, num_IoTD, T
+        self.size = torch.tensor([300.0, 300.0, 300.0], device=self.device)
+        iot_positions = np.array([[50,50,0],[75,150,0],[100,100,0],[100,250,0],[150,150,0]], dtype=np.float32)
+        self.iotd_position = torch.tensor(iot_positions, device=self.device, dtype=torch.float32)
+        self.eavesdropper_pos = torch.tensor([150.0, 0.0, 0.0], device=self.device)
+        self.R_min, self.P_tx_UAV, self.P_tx_IoTD, self.P_jammer = 0.2, 0.5, 0.1, 0.1
+        self.eta, self.beta_0, self.noise_power = 0.5, 1e-3, 1e-13
+        self.collision_threshold = 5.0
+        self.iot_idle_drain_rate = 0.001
+        self.iot_comm_drain_rate = 0.05
+        self.uav_comm_energy_cost = 0.02
+        self.action_spaces = [Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32) for _ in range(self.num_uavs)]
+        obs_shape = (self.num_uavs * 3) + (2 * self.num_IoTD) + self.num_uavs
+        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(obs_shape,), dtype=np.float32)
+        self.llm = LLM_Simulator()
+        self.current_assignments = []
+        self.reset()
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        low = torch.tensor([0.0, 0.0, 100.0], device=self.device)
+        self.uav_positions = low + torch.rand((self.num_uavs, 3), device=self.device) * (self.size - low)
+        self.AoI = torch.zeros(self.num_IoTD, device=self.device)
+        self.iot_energy_levels = torch.ones(self.num_IoTD, device=self.device)
+        self.uav_energy_levels = torch.ones(self.num_uavs, device=self.device)
+        self.time = 0
+        self.collision_count = 0
+        return self._get_obs(), {}
+
+    def _get_global_state(self):
+        return torch.cat([
+            self.uav_positions.flatten(), self.AoI, self.iot_energy_levels, self.uav_energy_levels
+        ]).detach().cpu().numpy()
+
+    def _get_obs(self):
+        global_state = self._get_global_state()
+        return [global_state for _ in range(self.num_agents)]
+
+    def step(self, actions):
+        actions_t = torch.from_numpy(actions).to(self.device).float()
+        self.time += 1
+        self.AoI += 1.0
+        self.iot_energy_levels -= self.iot_idle_drain_rate
+        self.iot_energy_levels.clamp_(min=0.0)
+        past_positions = self.uav_positions.clone()
+        self.uav_positions += actions_t * 20.0
+        collision_penalty = self._check_collisions_torch()
+        boundary_penalty = self._check_boundaries_torch()
+        propulsion_energy = torch.sum(torch.linalg.norm(self.uav_positions - past_positions, dim=1))
+        avg_aoi = torch.mean(self.AoI).item()
+        aoi_penalty_weight, energy_penalty_weight = self.llm.adjust_penalties(avg_aoi, propulsion_energy.item())
+        if self.time % 25 == 0 or not self.current_assignments:
+            self.current_assignments = self.llm.decide_task_offload(self.uav_positions, self.iotd_position)
+        reward_success, reward_fail = 0.0, 0.0
+        for uav_idx, iot_idx in self.current_assignments:
+            if self.uav_energy_levels[uav_idx] < self.uav_comm_energy_cost:
+                reward_fail -= 0.5
+                continue
+            collector_uav_pos = self.uav_positions[uav_idx]
+            dist_UAV_IoTD = torch.linalg.norm(collector_uav_pos - self.iotd_position[iot_idx])
+            energy_harvested = self.P_tx_UAV * (self.beta_0 / (dist_UAV_IoTD**2 + 1e-9)) * self.eta
+            self.iot_energy_levels[iot_idx] += energy_harvested
+            if self.iot_energy_levels[iot_idx] >= self.iot_comm_drain_rate:
+                self.iot_energy_levels[iot_idx] -= self.iot_comm_drain_rate
+                secure_rate = self._calculate_secure_rate_torch(collector_uav_pos, self.iotd_position[iot_idx])
+                if secure_rate > self.R_min:
+                    reward_success += 10.0
+                    self.AoI[iot_idx] = 0.0
+                else: reward_fail -= 1.0
+            else: reward_fail -= 1.0
+            self.uav_energy_levels[uav_idx] -= self.uav_comm_energy_cost
+        self.iot_energy_levels.clamp_(min=0.0, max=1.0)
+        self.uav_energy_levels.clamp_(min=0.0, max=1.0)
+        aoi_penalty = -aoi_penalty_weight * torch.mean(self.AoI).item()
+        energy_penalty = -energy_penalty_weight * propulsion_energy.item()
+        reward = reward_success + reward_fail + aoi_penalty + energy_penalty + collision_penalty + boundary_penalty
+        terminated = self.time >= self.T
+        info = {'propulsion_energy': propulsion_energy.item(), 'sum_AoI': torch.sum(self.AoI).item(), 'collisions': self.collision_count, 'avg_iot_energy': torch.mean(self.iot_energy_levels).item(), 'avg_uav_energy': torch.mean(self.uav_energy_levels).item()}
+        return self._get_obs(), reward, terminated, False, info
+
+    def _check_boundaries_torch(self):
+        lower, upper = torch.tensor([0.,0.,0.], device=self.device), self.size
+        out_of_bounds = torch.any((self.uav_positions < lower) | (self.uav_positions > upper), dim=1)
+        penalty = -1.0 * torch.sum(out_of_bounds).item()
+        self.uav_positions.clamp_(min=0.)
+        for i in range(3): self.uav_positions[:, i].clamp_(max=self.size[i])
+        return penalty
+
+    def _check_collisions_torch(self):
+        penalty = 0.0
+        for uav1_idx, uav2_idx in combinations(range(self.num_uavs), 2):
+            dist = torch.linalg.norm(self.uav_positions[uav1_idx] - self.uav_positions[uav2_idx])
+            if dist < self.collision_threshold:
+                penalty -= 1.0; self.collision_count += 1
+        return penalty
+
+    def _calculate_secure_rate_torch(self, collector_pos, iotd_pos):
+        jammer_pos = self.uav_positions[2]
+        get_gain = lambda p1, p2: self.beta_0 / (torch.sum((p1-p2)**2) + 1e-9)
+        sig_main = self.P_tx_IoTD * get_gain(iotd_pos, collector_pos)
+        inter_main = self.P_jammer * get_gain(jammer_pos, collector_pos) + self.noise_power
+        rate_main = torch.log2(1.0 + sig_main / inter_main)
+        sig_eve = self.P_tx_IoTD * get_gain(iotd_pos, self.eavesdropper_pos)
+        inter_eve = self.P_jammer * get_gain(jammer_pos, self.eavesdropper_pos) + self.noise_power
+        rate_eve = torch.log2(1.0 + sig_eve / inter_eve)
+        return torch.clamp(rate_main - rate_eve, min=0.0)
+
+
+# MODIFIED: Plotting function for TD3
+def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
+    fig, axs = plt.subplots(6, 1, figsize=(12, 30), sharex=True)
+    fig.suptitle('MATD3 with LLM Guidance Training Performance', fontsize=18)
+    axs[0].plot(log_df['episode'], log_df['reward'], color='green'); axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward"); axs[0].grid(True)
+    axs[1].plot(log_df['episode'], log_df['avg_critic_loss'], color='red'); axs[1].set_title("Average Critic Loss"); axs[1].set_ylabel("Loss"); axs[1].grid(True)
+    axs[2].plot(log_df['episode'], log_df['avg_actor_loss'], color='blue'); axs[2].set_title("Average Actor Loss"); axs[2].set_ylabel("Loss"); axs[2].grid(True)
+    axs[3].plot(log_df['episode'], log_df['avg_propulsion_energy'], color='purple'); axs[3].set_title("Average Propulsion Energy"); axs[3].set_ylabel("Energy"); axs[3].grid(True)
+    axs[4].plot(log_df['episode'], log_df['avg_sum_aoi'], color='orange'); axs[4].set_title("Average Sum of AoI"); axs[4].set_ylabel("AoI"); axs[4].grid(True)
+    axs[5].plot(log_df['episode'], log_df['total_collisions'], color='black'); axs[5].set_title("Total Collisions per Episode"); axs[5].set_ylabel("Collisions"); axs[5].set_xlabel("Episode"); axs[5].grid(True)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
+    print(f"\nPlots saved to {os.path.abspath(filename)}")
+
+# MODIFIED: Main training loop for TD3
+def main():
+    env = MultiAgentEnv(num_uavs=3)
+    torch.manual_seed(config['seed']); np.random.seed(config['seed'])
+
+    agent = MATD3(
+        global_state_dim=env.observation_space.shape[0],
+        action_spaces=env.action_spaces,
+        num_agents=env.num_agents,
+        args=config
+    )
+    memory = ReplayBuffer(config['replay_size'])
+    total_numsteps = 0
+    training_logs = []
+
+    for i_episode in range(config['max_episodes']):
+        obs, _ = env.reset(seed=config['seed'] + i_episode)
+        episode_reward, episode_steps, done = 0, 0, False
+        episode_critic_losses, episode_actor_losses = [], []
+        episode_propulsion_energy, episode_sum_aoi, episode_collisions = [], [], []
+
+        while not done:
+            if config['start_steps'] > total_numsteps:
+                # Warm-up phase: purely random actions
+                actions = np.array([space.sample() for space in env.action_spaces])
+            else:
+                # Policy action with exploration noise
+                actions = agent.select_actions(obs, exploration_noise=config['exploration_noise'])
+
+            next_obs, reward, terminated, truncated, info = env.step(actions)
+            done = terminated or truncated
+
+            # Store the global state and joint actions
+            global_state = env._get_global_state()
+            next_global_state = env._get_global_state()
+            memory.push(global_state, actions.flatten(), reward, next_global_state, done)
+
+            if total_numsteps > config['batch_size']:
+                critic_loss, actor_loss = agent.update_parameters(memory)
+                if critic_loss is not None: episode_critic_losses.append(critic_loss)
+                if actor_loss is not None: episode_actor_losses.append(actor_loss)
+
+            episode_propulsion_energy.append(info['propulsion_energy'])
+            episode_sum_aoi.append(info['sum_AoI'])
+
+            obs = next_obs
+            episode_steps += 1
+            total_numsteps += 1
+            episode_reward += reward
+
+        episode_collisions.append(info['collisions'])
+        critic_loss_mean = np.mean(episode_critic_losses) if episode_critic_losses else -1
+        actor_loss_mean = np.mean(episode_actor_losses) if episode_actor_losses else -1
+
+        log_entry = {
+            'episode': i_episode + 1, 'reward': episode_reward,
+            'avg_critic_loss': critic_loss_mean, 'avg_actor_loss': actor_loss_mean,
+            'avg_propulsion_energy': np.mean(episode_propulsion_energy),
+            'avg_sum_aoi': np.mean(episode_sum_aoi),
+            'total_collisions': np.sum(episode_collisions)
+        }
+        training_logs.append(log_entry)
+
+        print(f"E: {i_episode+1}, R: {episode_reward/100:.2f}, Energy: {np.mean(episode_propulsion_energy):.2f}, "
+              f"AoI: {np.mean(episode_sum_aoi):.2f}, Collisions: {np.sum(episode_collisions)}, "
+              f"CL: {critic_loss_mean:.4f}, AL: {actor_loss_mean:.4f}")
+
+    env.close()
+    log_df = pd.DataFrame(training_logs)
+    csv_filename = 'matd3_llm_training_logs.csv'
+    log_df.to_csv(csv_filename, index=False)
+    print(f"\nTraining logs saved to {os.path.abspath(csv_filename)}")
+    plot_and_save_results(log_df)
+
+if __name__ == '__main__':
+    main()
