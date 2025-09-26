@@ -454,7 +454,7 @@ class MultiAgentEnv(gym.Env):
         return torch.clamp(rate_main - rate_eve, min=0.0)
 
 # --- Plotting and Visualization ---
-def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
+def plot_and_save_results(log_df, filename="magmtd3_training_performance.png"):
     fig, axs = plt.subplots(7, 1, figsize=(12, 35), sharex=True)
     fig.suptitle('MATD3 with Diffusion Actor Training Performance', fontsize=18)
     axs[0].plot(log_df['episode'], log_df['reward'], color='green'); axs[0].set_title("Episodic Reward"); axs[0].set_ylabel("Reward"); axs[0].grid(True)
@@ -469,7 +469,7 @@ def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
     plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
     print(f"\nPlots saved to {os.path.abspath(filename)}")
 
-def visualize_episode(episode_history, env_params, filename="uav_flight_paths.png", low_energy_threshold=0.1):
+def visualize_episode(episode_history, env_params, filename="uav_flight_pathsgmtd3.png", low_energy_threshold=0.1):
     """
     Visualizes UAV flight paths, highlighting a task offloading event when a
     UAV's energy drops below a specified threshold.
