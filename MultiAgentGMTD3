@@ -111,10 +111,12 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+# --- MODIFIED: DenoisingNetwork with Transformer Architecture ---
 class DenoisingNetwork(nn.Module):
-    """A simple MLP to predict noise in a diffusion model."""
-    def __init__(self, state_dim, action_dim, hidden_dim, time_emb_dim=32):
+    """A Transformer-based network to predict noise in a diffusion model."""
+    def __init__(self, state_dim, action_dim, hidden_dim, time_emb_dim=32, nhead=4, num_encoder_layers=2):
         super().__init__()
+        # Time embedding network
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2),
@@ -122,35 +124,11 @@ class DenoisingNetwork(nn.Module):
             nn.Linear(time_emb_dim * 2, time_emb_dim),
         )
 
+        # Input embedding layer for the transformer
         input_dim = state_dim + action_dim + time_emb_dim
-        self.mid_layer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, action_dim)
-        )
+        self.input_embed = nn.Linear(input_dim, hidden_dim)
 
-    def forward(self, state, noisy_action, time):
-        t = self.time_mlp(time)
-        x = torch.cat([state, noisy_action, t], dim=1)
-        return self.mid_layer(x)
-
-# --- Decentralized Diffusion Actor Network ---
-# --- NEW: Transformer Actor Network ---
-class TransformerActor(nn.Module):
-    """
-    An actor network that uses a Transformer Encoder to process the state.
-    It treats the state vector as a sequence of one item.
-    """
-    def __init__(self, state_dim, action_dim, hidden_dim, max_action=1.0, nhead=4, num_encoder_layers=2):
-        super(TransformerActor, self).__init__()
-        self.max_action = max_action
-        
-        # 1. Input Embedding
-        self.input_embed = nn.Linear(state_dim, hidden_dim)
-        
-        # 2. Transformer Encoder
+        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=nhead,
@@ -158,26 +136,64 @@ class TransformerActor(nn.Module):
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-        
-        # 3. Output Head
+
+        # Output head to predict noise
         self.output_head = nn.Linear(hidden_dim, action_dim)
+
+
+    def forward(self, state, noisy_action, time):
+        # 1. Get time embedding
+        t_emb = self.time_mlp(time)
         
-    def forward(self, state):
-        # Embed the input state vector
-        x = self.input_embed(state)
+        # 2. Concatenate all inputs
+        x = torch.cat([state, noisy_action, t_emb], dim=1)
         
-        # The Transformer expects a sequence, so we add a sequence dimension of size 1
+        # 3. Embed the concatenated input for the transformer
+        x = self.input_embed(x)
+        
+        # 4. Reshape for transformer (add a sequence dimension)
         x = x.unsqueeze(1)
         
-        # Pass through the Transformer Encoder
+        # 5. Pass through transformer encoder
         x = self.transformer_encoder(x)
         
-        # Remove the sequence dimension
+        # 6. Reshape back (remove the sequence dimension)
         x = x.squeeze(1)
         
-        # Get the action and scale it
-        action = self.max_action * torch.tanh(self.output_head(x))
-        return action
+        # 7. Predict the noise
+        return self.output_head(x)
+
+# --- Decentralized Diffusion Actor Network (Unchanged)---
+class DiffusionActor(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim, max_action=1.0, diffusion_steps=5, device="cpu"):
+        super().__init__()
+        self.action_dim = action_dim
+        self.max_action = max_action
+        self.diffusion_steps = diffusion_steps
+        self.device = device
+        # The DenoisingNetwork now uses the new Transformer architecture
+        self.denoising_net = DenoisingNetwork(state_dim, action_dim, hidden_dim).to(device)
+        betas = torch.linspace(1e-4, 0.02, diffusion_steps, device=device)
+        alphas = 1. - betas
+        self.alphas_cumprod = torch.cumprod(alphas, axis=0)
+
+    def forward(self, state):
+        batch_size = state.shape[0]
+        action = torch.randn((batch_size, self.action_dim), device=self.device)
+        for t in reversed(range(self.diffusion_steps)):
+            time_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+            predicted_noise = self.denoising_net(state, action, time_tensor)
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_prev = self.alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0, device=self.device)
+            pred_action_mean = (1 / torch.sqrt(alpha_t)) * (action - ((1 - alpha_t) / torch.sqrt(1 - self.alphas_cumprod[t])) * predicted_noise)
+            if t == 0:
+                action = pred_action_mean
+            else:
+                variance = (1 - alpha_t_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_t_prev)
+                noise = torch.randn_like(action)
+                action = pred_action_mean + torch.sqrt(variance) * noise
+        return self.max_action * torch.tanh(action)
+
 # --- Centralized Transformer Critic Network ---
 class TransformerCritic(nn.Module):
     def __init__(self, num_agents, state_dim, action_dim, hidden_dim):
@@ -453,36 +469,91 @@ def plot_and_save_results(log_df, filename="matd3_training_performance.png"):
     plt.tight_layout(rect=[0, 0.03, 1, 0.97]); plt.savefig(filename); plt.close()
     print(f"\nPlots saved to {os.path.abspath(filename)}")
 
-def visualize_episode(episode_history, env_params, filename="uav_flight_paths.png"):
-    fig = plt.figure(figsize=(12, 10)); ax = fig.add_subplot(111, projection='3d')
-    iot_pos = env_params['iotd_position'].cpu().numpy(); eve_pos = env_params['eavesdropper_pos'].cpu().numpy()
-    ax.scatter(iot_pos[:,0],iot_pos[:,1],iot_pos[:,2], c='blue', marker='o', s=100, label='IoT Devices')
+def visualize_episode(episode_history, env_params, filename="uav_flight_paths.png", low_energy_threshold=0.1):
+    """
+    Visualizes UAV flight paths, highlighting a task offloading event when a
+    UAV's energy drops below a specified threshold.
+    """
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    iot_pos = env_params['iotd_position'].cpu().numpy()
+    eve_pos = env_params['eavesdropper_pos'].cpu().numpy()
+
+    # Plot static elements
+    ax.scatter(iot_pos[:,0], iot_pos[:,1], iot_pos[:,2], c='blue', marker='o', s=100, label='IoT Devices')
     ax.scatter(eve_pos[0], eve_pos[1], eve_pos[2], c='red', marker='x', s=150, label='Eavesdropper')
+
+    # --- New Logic to Detect Task Offloading ---
+    offload_step = None
+    handover_pos = None
+    # Find the first timestep where UAV 1's energy is low
+    for i, step_data in enumerate(episode_history):
+        # UAV 1 is at index 0
+        if 'uav_energy' in step_data and step_data['uav_energy'][0] < low_energy_threshold:
+            offload_step = i
+            handover_pos = step_data['uav_positions'][0]
+            print(f"Task offload detected at step {offload_step}!")
+            break
+
+    # Extract trajectories for all UAVs
     num_uavs = episode_history[0]['uav_positions'].shape[0]
     uav_trajectories = [[] for _ in range(num_uavs)]
     for step_data in episode_history:
-        for i in range(num_uavs): uav_trajectories[i].append(step_data['uav_positions'][i])
-    colors = ['orange', 'magenta', 'yellow']
+        for i in range(num_uavs):
+            uav_trajectories[i].append(step_data['uav_positions'][i])
+    
+    uav_paths = [np.array(traj) for traj in uav_trajectories]
+    colors = ['orange', 'magenta', 'pink'] # UAV1, UAV2, UAV3 colors
+    
+    # --- Plot paths with offloading visualization ---
     for i in range(num_uavs):
-        path = np.array(uav_trajectories[i])
-        ax.plot(path[:,0], path[:,1], path[:,2], color=colors[i], label=f'UAV {i+1} Path')
-        ax.scatter(path[0,0],path[0,1],path[0,2], color='green', marker='s', s=100, label=f'UAV {i+1} Start' if i==0 else "")
-        ax.scatter(path[-1,0],path[-1,1],path[-1,2], color='black', marker='*', s=150, label=f'UAV {i+1} End' if i==0 else "")
-    final_assignments = episode_history[-1]['assignments']; final_uav_pos = episode_history[-1]['uav_positions']
+        path = uav_paths[i]
+        
+        # Plot Start and End points for all UAVs
+        ax.scatter(path[0,0], path[0,1], path[0,2], color='green', marker='s', s=100, label=f'UAV {i+1} Start' if i==0 else "")
+        ax.scatter(path[-1,0], path[-1,1], path[-1,2], color='black', marker='*', s=150, label=f'UAV {i+1} End' if i==0 else "")
+
+        # If offload never happened, plot normally
+        if offload_step is None:
+             ax.plot(path[:,0], path[:,1], path[:,2], color=colors[i], label=f'UAV {i+1} Path')
+        else:
+            # Special plotting for offloading scenario
+            if i == 0: # UAV 1 (Low Energy)
+                ax.plot(path[:offload_step+1,0], path[:offload_step+1,1], path[:offload_step+1,2], color=colors[i], label='UAV 1 Path (Before Failure)')
+            elif i == 1: # UAV 2 (Takeover)
+                # Plot path before offload in its own color
+                ax.plot(path[:offload_step+1,0], path[:offload_step+1,1], path[:offload_step+1,2], color=colors[i], label='UAV 2 Path (Normal)')
+                # Plot path after offload in UAV 1's color
+                ax.plot(path[offload_step:,0], path[offload_step:,1], path[offload_step:,2], color=colors[0], linestyle='--', label='UAV 2 Path (Takeover)')
+            else: # Other UAVs (e.g., Jammer)
+                ax.plot(path[:,0], path[:,1], path[:,2], color=colors[i], label=f'UAV {i+1} Path')
+
+    # Mark the handover position if it occurred
+    if handover_pos is not None:
+        ax.scatter(handover_pos[0], handover_pos[1], handover_pos[2], c='red', marker='X', s=200, label='Handover Point', depthshade=False)
+        
+    # Plot final communication links
+    final_assignments = episode_history[-1]['assignments']
+    final_uav_pos = episode_history[-1]['uav_positions']
     for uav_idx, iot_idx in final_assignments:
         uav_p, iot_p = final_uav_pos[uav_idx], iot_pos[iot_idx]
-        ax.plot([uav_p[0], iot_p[0]], [uav_p[1], iot_p[1]], [uav_p[2], iot_p[2]], 'k--')
-    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z (Altitude)'); ax.set_title('UAV Flight Paths')
+        ax.plot([uav_p[0], iot_p[0]], [uav_p[1], iot_p[1]], [uav_p[2], iot_p[2]], 'k--', alpha=0.7)
+
+    # Set plot labels and limits
+    ax.set_xlabel('X Coordinate'); ax.set_ylabel('Y Coordinate'); ax.set_zlabel('Z (Altitude)')
+    ax.set_title('UAV Flight Paths with Task Offloading')
     size = env_params['size'].cpu().numpy()
     ax.set_xlim(0, size[0]); ax.set_ylim(0, size[1]); ax.set_zlim(0, size[2])
-    ax.legend(); ax.grid(True); plt.savefig(filename); plt.close()
-    print(f"\nEpisode visualization saved to {os.path.abspath(filename)}")
+    ax.legend(); ax.grid(True)
+    plt.savefig(filename)
+    plt.close()
+    print(f"\nEpisode visualization with offloading saved to {os.path.abspath(filename)}")
 
 # --- Constants and Hyperparameters ---
 config = {
     'seed': 12345, 'max_episodes': 1000, 'replay_size': 1000000, 'gamma': 0.99,
     'tau': 0.001, 'lr': 1e-4, 'hidden_size': 256, 'batch_size': 512, 'start_steps': 2000,
-    'policy_noise': 0.2, 'noise_clip': 0.5, 'policy_freq': 2,'epsilon': 0.1,         # 10% random exploration
+    'policy_noise': 0.2, 'noise_clip': 0.5, 'policy_freq': 2,'epsilon': 0.1,        # 10% random exploration
     'epsilon_decay': 0.995, # optional: decay per episode
     'epsilon_min': 0.01
 }
@@ -529,10 +600,10 @@ def main():
             if config['start_steps'] > total_numsteps:
                 actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
             else:
-              if np.random.rand() < config['epsilon']:
+                if np.random.rand() < config['epsilon']:
                     # ε chance → exploration (random action for each agent)
                     actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
-              else:
+                else:
                     # 1-ε chance → exploitation (policy action)
                     actions = agent.select_action(obs)
             next_obs, reward, terminated, truncated, info = env.step(actions)
@@ -581,14 +652,22 @@ def main():
     log_df.to_csv('matd3_training_logs.csv', index=False)
     plot_and_save_results(log_df)
 
+    # --- Find this loop at the end of your main() function ---
     print("\nRunning final episode for visualization...")
     obs, _ = env.reset(); done = False; episode_history = []
     while not done:
-        actions = agent.select_action(obs)
-        next_obs, _, terminated, truncated, _ = env.step(actions)
-        done = terminated or truncated
-        episode_history.append({'uav_positions': env.uav_positions.cpu().numpy(), 'assignments': env.current_assignments})
-        obs = next_obs
+      actions = agent.select_action(obs)
+      next_obs, _, terminated, truncated, _ = env.step(actions)
+      done = terminated or truncated
+    
+    # --- THIS IS THE LINE TO CHANGE ---
+    # Add 'uav_energy' to the dictionary
+      episode_history.append({
+        'uav_positions': env.uav_positions.cpu().numpy(), 
+        'assignments': env.current_assignments,
+        'uav_energy': env.uav_energy_levels.cpu().numpy() # <-- ADD THIS
+    })
+      obs = next_obs
     visualize_episode(episode_history, {'iotd_position':env.iotd_position, 'eavesdropper_pos':env.eavesdropper_pos, 'size':env.size})
 
 if __name__ == '__main__':
