@@ -566,7 +566,7 @@ def main():
 
     env.close()
     log_df = pd.DataFrame(training_logs)
-    log_df.to_csv('matd3_training_logs.csv', index=False)
+    log_df.to_csv('madmtd3_training_logs.csv', index=False)
     plot_and_save_results(log_df)
 
     print("\nRunning final episode for visualization...")
